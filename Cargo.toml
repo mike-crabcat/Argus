@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+repository = "https://github.com/mike-crabcat/argus"
+rust-version = "1.85"
+
+[workspace.dependencies]
+argus-media = { path = "crates/argus-media" }
+argus-store = { path = "crates/argus-store" }
+argus-ingest = { path = "crates/argus-ingest" }
+anyhow = "1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+h264-reader = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+retina = "0.4.22"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"

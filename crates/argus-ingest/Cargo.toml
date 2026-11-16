@@ -1,0 +1,20 @@
+[package]
+name = "argus-ingest"
+description = "Camera ingest for Argus: RTSP (via retina) and HTTP-FLV, both passthrough."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+argus-media.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+futures.workspace = true
+h264-reader.workspace = true
+reqwest.workspace = true
+retina.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
