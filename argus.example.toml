@@ -5,6 +5,34 @@
 root = "/var/lib/argus"
 # Each chunk object holds about this many seconds of one stream.
 chunk_seconds = 60
+# Optional cap on local recordings, in GB. Above it, the oldest chunks that
+# are safe to drop locally are deleted: ones already uploaded, "never"
+# streams, and "events" chunks with no event nearby once an hour old.
+# A chunk still waiting to upload is never deleted.
+local_budget_gb = 500
+
+# Optional: copy recordings to S3 or any S3-compatible store (MinIO,
+# Backblaze B2, Wasabi...). Without this section everything stays local.
+[s3]
+bucket = "my-nvr"
+region = "us-east-1"
+# endpoint = "https://s3.us-west-004.backblazeb2.com"   # non-AWS stores
+# prefix = "argus"                                       # key prefix in the bucket
+# Credentials: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars, or
+# ~/.aws/credentials (profile below, $AWS_PROFILE or "default"), or here:
+# profile = "nvr"
+# access_key_id = "..."
+# secret_access_key = "..."
+# Average upload cap in Mbit/s, so catching up never fills the line. 0 = no cap.
+max_upload_mbps = 50
+
+# Which chunks go to S3, per stream (camera.upload.<stream>):
+#   "always" - every chunk. Default for every stream except "main".
+#   "events" - chunks within 10 s of an event. Default for "main".
+#   "never"  - local only.
+# So by default the low-res sub stream is always in S3, and full resolution
+# only around events. Mark one by hand with:
+#   argus event add --camera driveway --from now-5m --to now
 
 # Reolink tips:
 #  * H.264 streams: prefer HTTP-FLV, Reolink's RTSP server is unreliable.
@@ -20,3 +48,5 @@ streams.sub = "http://192.168.1.20/flv?port=1935&app=bcs&stream=channel0_sub.bcs
 name = "front_door"
 streams.main = "http://192.168.1.21/flv?port=1935&app=bcs&stream=channel0_main.bcs&user=admin&password=password"
 streams.sub = "http://192.168.1.21/flv?port=1935&app=bcs&stream=channel0_sub.bcs&user=admin&password=password"
+# Keep this camera's full resolution in S3 all the time.
+upload.main = "always"

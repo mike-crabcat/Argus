@@ -8,7 +8,7 @@ use crate::gop_index::{self, GopEntry};
 /// The metadata store. Answers "which bytes hold camera X at time T" without
 /// touching the video itself.
 pub struct Index {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,14 +61,77 @@ CREATE TABLE IF NOT EXISTS chunk (
     gop_index   BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chunk_by_time ON chunk (camera, stream, start_ms);
+-- Things worth keeping at full resolution: manual marks now, camera motion
+-- and AI triggers and Argus's own detections later.
+CREATE TABLE IF NOT EXISTS event (
+    id          INTEGER PRIMARY KEY,
+    camera      TEXT NOT NULL,
+    start_ms    INTEGER NOT NULL,
+    end_ms      INTEGER NOT NULL,
+    source      TEXT NOT NULL,
+    label       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS event_by_time ON event (camera, start_ms);
 "#;
+
+/// Where a chunk's bytes live. `tier` on the chunk table.
+pub mod tier {
+    /// On local disk (and, if `uploaded_at` is set, also in object storage).
+    pub const LOCAL: &str = "local";
+    /// Evicted from local disk after upload; only in object storage.
+    pub const REMOTE: &str = "remote";
+    /// Evicted without ever being uploaded (by policy). The row stays as a
+    /// record that the recording existed.
+    pub const DISCARDED: &str = "discarded";
+}
 
 /// Columns added after the first release, as (table, column, type). Added
 /// to existing databases on open.
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // RFC 6381 codec of the audio track, NULL for video-only init segments.
     ("init_segment", "audio_rfc6381", "TEXT"),
+    // Upload state: when (ms since epoch) and under which object key.
+    ("chunk", "uploaded_at", "INTEGER"),
+    ("chunk", "remote", "TEXT"),
+    ("init_segment", "uploaded_at", "INTEGER"),
+    ("init_segment", "remote", "TEXT"),
 ];
+
+/// A closed chunk, as the uploader and eviction see it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredChunk {
+    pub id: i64,
+    pub camera: String,
+    pub stream: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub object_key: String,
+    pub bytes: u64,
+    pub init_id: i64,
+    pub uploaded: bool,
+}
+
+const STORED_CHUNK_COLUMNS: &str = "c.id, c.camera, c.stream, c.start_ms, c.end_ms, c.object_key, c.bytes, c.init_id, \
+     c.uploaded_at IS NOT NULL";
+
+fn stored_chunk(r: &rusqlite::Row) -> rusqlite::Result<StoredChunk> {
+    Ok(StoredChunk {
+        id: r.get(0)?,
+        camera: r.get(1)?,
+        stream: r.get(2)?,
+        start_ms: r.get(3)?,
+        end_ms: r.get(4)?,
+        object_key: r.get(5)?,
+        bytes: r.get::<_, i64>(6)? as u64,
+        init_id: r.get(7)?,
+        uploaded: r.get(8)?,
+    })
+}
+
+/// SQL condition: an event on the chunk's camera overlaps the chunk,
+/// widened by `?pad` ms on both sides.
+const EVENT_OVERLAP: &str = "EXISTS (SELECT 1 FROM event e WHERE e.camera = c.camera \
+     AND e.start_ms < c.end_ms + :pad AND e.end_ms > c.start_ms - :pad)";
 
 impl Index {
     pub fn open(path: &Path) -> Result<Self> {
@@ -80,6 +143,8 @@ impl Index {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // The CLI writes events while the server runs; wait for its locks.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         for (table, column, ty) in ADDED_COLUMNS {
             let exists: bool = conn.query_row(
@@ -155,6 +220,7 @@ impl Index {
                 "SELECT c.object_key, i.object_key, c.start_ms, c.gop_index
                    FROM chunk c JOIN init_segment i ON i.id = c.init_id
                   WHERE c.camera = ?1 AND c.stream = ?2 AND c.start_ms <= ?3 AND c.end_ms > ?3
+                    AND c.tier != 'discarded'
                   ORDER BY c.start_ms DESC LIMIT 1",
                 params![camera, stream, t_ms],
                 |r| {
@@ -184,6 +250,133 @@ impl Index {
         }))
     }
 
+    /// Records an event; returns its id.
+    pub fn add_event(
+        &self,
+        camera: &str,
+        start_ms: i64,
+        end_ms: i64,
+        source: &str,
+        label: &str,
+    ) -> Result<i64> {
+        anyhow::ensure!(end_ms >= start_ms, "event ends before it starts");
+        self.conn.execute(
+            "INSERT INTO event (camera, start_ms, end_ms, source, label) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![camera, start_ms, end_ms, source, label],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Local chunks of one stream not yet uploaded, oldest first. With
+    /// `event_pad_ms`, only those overlapping an event (widened by that much).
+    pub fn pending_uploads(
+        &self,
+        camera: &str,
+        stream: &str,
+        event_pad_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<StoredChunk>> {
+        let filter = if event_pad_ms.is_some() {
+            format!("AND {EVENT_OVERLAP}")
+        } else {
+            String::new()
+        };
+        let mut st = self.conn.prepare_cached(&format!(
+            "SELECT {STORED_CHUNK_COLUMNS} FROM chunk c
+              WHERE c.camera = :camera AND c.stream = :stream AND c.tier = 'local'
+                AND c.uploaded_at IS NULL {filter}
+              ORDER BY c.start_ms LIMIT :limit"
+        ))?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = if let Some(pad) = event_pad_ms {
+            st.query_map(
+                rusqlite::named_params! {":camera": camera, ":stream": stream, ":pad": pad, ":limit": limit},
+                stored_chunk,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            st.query_map(
+                rusqlite::named_params! {":camera": camera, ":stream": stream, ":limit": limit},
+                stored_chunk,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(rows)
+    }
+
+    /// Whether an event on `camera` overlaps the chunk, widened by `pad_ms`.
+    pub fn chunk_has_event(&self, chunk: &StoredChunk, pad_ms: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            &format!("SELECT {EVENT_OVERLAP} FROM chunk c WHERE c.id = :id"),
+            rusqlite::named_params! {":id": chunk.id, ":pad": pad_ms},
+            |r| r.get(0),
+        )?)
+    }
+
+    /// An init segment's object key and whether it has been uploaded.
+    pub fn init_upload_state(&self, init_id: i64) -> Result<(String, bool)> {
+        Ok(self.conn.query_row(
+            "SELECT object_key, uploaded_at IS NOT NULL FROM init_segment WHERE id = ?1",
+            [init_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
+    pub fn mark_init_uploaded(&self, init_id: i64, remote: &str, at_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE init_segment SET uploaded_at = ?2, remote = ?3 WHERE id = ?1",
+            params![init_id, at_ms, remote],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_chunk_uploaded(&self, chunk_id: i64, remote: &str, at_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chunk SET uploaded_at = ?2, remote = ?3 WHERE id = ?1",
+            params![chunk_id, at_ms, remote],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_tier(&self, chunk_id: i64, tier: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chunk SET tier = ?2 WHERE id = ?1",
+            params![chunk_id, tier],
+        )?;
+        Ok(())
+    }
+
+    /// Bytes of chunk files on local disk.
+    pub fn local_bytes(&self) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM chunk WHERE tier = 'local'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Local chunks, oldest first, starting after `after` (start_ms, id).
+    pub fn local_chunks_oldest_first(
+        &self,
+        after: Option<(i64, i64)>,
+        limit: usize,
+    ) -> Result<Vec<StoredChunk>> {
+        let (t, id) = after.unwrap_or((i64::MIN, i64::MIN));
+        let mut st = self.conn.prepare_cached(&format!(
+            "SELECT {STORED_CHUNK_COLUMNS} FROM chunk c
+              WHERE c.tier = 'local' AND (c.start_ms, c.id) > (?1, ?2)
+              ORDER BY c.start_ms, c.id LIMIT ?3"
+        ))?;
+        let rows = st
+            .query_map(
+                params![t, id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                stored_chunk,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Chunks overlapping [from_ms, to_ms), oldest first.
     pub fn chunks_between(
         &self,
@@ -194,7 +387,8 @@ impl Index {
     ) -> Result<Vec<ChunkRecord>> {
         let mut st = self.conn.prepare(
             "SELECT camera, stream, start_ms, end_ms, object_key, bytes, init_id, gop_index FROM chunk
-              WHERE camera = ?1 AND stream = ?2 AND end_ms > ?3 AND start_ms < ?4 ORDER BY start_ms",
+              WHERE camera = ?1 AND stream = ?2 AND end_ms > ?3 AND start_ms < ?4
+                AND tier != 'discarded' ORDER BY start_ms",
         )?;
         let rows = st.query_map(params![camera, stream, from_ms, to_ms], |r| {
             Ok(ChunkRecord {

@@ -1,20 +1,50 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use argus_server::config::Config;
 use argus_server::recorder::{self, StreamEvent};
-use argus_store::{ChunkWriter, Index};
-use clap::Parser;
+use argus_server::{s3, timearg};
+use argus_store::{ChunkWriter, Index, Uploader, upload};
+use clap::{Parser, Subcommand};
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(version, about = "Argus NVR server")]
 struct Args {
     /// Path to argus.toml.
-    #[arg(short, long, default_value = "argus.toml")]
+    #[arg(short, long, default_value = "argus.toml", global = true)]
     config: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Record, upload and manage local disk (the default).
+    Run,
+    /// Manage events (periods worth keeping at full resolution).
+    #[command(subcommand)]
+    Event(EventCommand),
+}
+
+#[derive(Subcommand)]
+enum EventCommand {
+    /// Mark a period on one camera as an event.
+    Add {
+        #[arg(long)]
+        camera: String,
+        /// Start: RFC 3339 (2026-11-16T21:30:00Z), Unix ms, or now[-+]N[smh].
+        #[arg(long, allow_hyphen_values = true)]
+        from: String,
+        /// End, in the same formats.
+        #[arg(long, allow_hyphen_values = true)]
+        to: String,
+        #[arg(long, default_value = "manual")]
+        label: String,
+    },
 }
 
 #[tokio::main]
@@ -27,6 +57,28 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     let cfg = Config::load(&args.config)?;
+    match args.command.unwrap_or(Command::Run) {
+        Command::Run => run(cfg).await,
+        Command::Event(EventCommand::Add {
+            camera,
+            from,
+            to,
+            label,
+        }) => {
+            if !cfg.cameras.iter().any(|c| c.name == camera) {
+                warn!("camera {camera:?} is not in the config");
+            }
+            let now = upload::now_ms();
+            let (from, to) = (timearg::parse(&from, now)?, timearg::parse(&to, now)?);
+            let index = Index::open(&cfg.storage.root.join("index.sqlite"))?;
+            let id = index.add_event(&camera, from, to, "cli", &label)?;
+            println!("event {id}: {camera} {from}..{to} ms ({label})");
+            Ok(())
+        }
+    }
+}
+
+async fn run(cfg: Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.storage.root)
         .with_context(|| format!("creating {}", cfg.storage.root.display()))?;
     let index = Arc::new(Mutex::new(Index::open(
@@ -58,10 +110,70 @@ async fn main() -> Result<()> {
     }
     info!(streams = ingest.len(), root = %cfg.storage.root.display(), "recording");
 
+    let mut background = Vec::new();
+    if let Some(s3cfg) = &cfg.s3 {
+        let store = s3::connect(s3cfg)?;
+        let uploader = Uploader::new(
+            store,
+            index.clone(),
+            &cfg.storage.root,
+            &s3cfg.prefix,
+            cfg.stream_policies(),
+            s3cfg.max_upload_mbps,
+        );
+        info!(bucket = %s3cfg.bucket, prefix = %s3cfg.prefix,
+              max_mbps = s3cfg.max_upload_mbps, "uploading");
+        background.push(tokio::spawn(async move {
+            if let Err(e) = uploader.run().await {
+                warn!("uploader stopped: {e:#}");
+            }
+        }));
+    }
+    if let Some(gb) = cfg.storage.local_budget_gb {
+        let budget = (gb * 1e9) as u64;
+        let (index, root, cfg) = (index.clone(), cfg.storage.root.clone(), Arc::new(cfg));
+        background.push(tokio::spawn(async move {
+            loop {
+                let (index, root, cfg) = (index.clone(), root.clone(), cfg.clone());
+                let res = tokio::task::spawn_blocking(move || {
+                    let index = index.lock().unwrap();
+                    upload::evict(
+                        &index,
+                        &root,
+                        budget,
+                        |c, s| cfg.policy(c, s),
+                        upload::now_ms(),
+                    )
+                })
+                .await;
+                match res {
+                    Ok(Ok(ev)) => {
+                        if ev.chunks > 0 {
+                            info!(
+                                chunks = ev.chunks,
+                                mb = ev.bytes / 1_000_000,
+                                "freed local disk"
+                            );
+                        }
+                        if ev.over_budget > 0 {
+                            warn!(
+                                over_mb = ev.over_budget / 1_000_000,
+                                "over local_budget_gb: the rest is waiting to upload or may still get an event"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => warn!("eviction failed: {e:#}"),
+                    Err(e) => warn!("eviction task failed: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }));
+    }
+
     tokio::signal::ctrl_c().await?;
     info!("shutting down, closing open chunks");
-    for t in &ingest {
-        t.abort(); // drops each broadcast sender, which ends its recorder
+    for t in background.iter().chain(&ingest) {
+        t.abort(); // ingest: drops each broadcast sender, which ends its recorder
     }
     for r in recorders {
         r.await??;

@@ -36,6 +36,14 @@ index.sqlite
 
 To play a chunk locally: `cat init/.../X.mp4 rec/.../Y.m4s > clip.mp4`.
 
+With an `[s3]` section, closed chunks are also uploaded: the `sub` stream
+always, `main` only around events (see `argus.example.toml` and
+[docs/architecture.md](docs/architecture.md)). Mark an event by hand with:
+
+```sh
+argus -c argus.toml event add --camera driveway --from now-5m --to now
+```
+
 ### Reolink cameras
 
 * Use the FLV URL for H.264 streams:
@@ -50,7 +58,7 @@ To play a chunk locally: `cat init/.../X.mp4 rec/.../Y.m4s > clip.mp4`.
 | Crate | Purpose |
 | --- | --- |
 | `argus-media` | Frames, codec config, wall clock, fMP4 muxer |
-| `argus-store` | Chunk writer, GOP seek table, SQLite index |
+| `argus-store` | Chunk writer, GOP seek table, SQLite index, S3 uploader |
 | `argus-ingest` | RTSP and HTTP-FLV sources |
 | `argus-server` | Config, supervision, the `argus` binary |
 
