@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 argus-ingest.workspace = true
 argus-media.workspace = true
+argus-proto.workspace = true
 argus-store.workspace = true
 anyhow.workspace = true
 axum.workspace = true

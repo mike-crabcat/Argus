@@ -71,6 +71,9 @@ pub struct Http {
     /// If set, every request must carry it (`Authorization: Bearer ...` or
     /// `?token=...`).
     pub token: Option<String>,
+    /// The built browser app (`web/dist` after `scripts/build-web.sh`),
+    /// served at `/`. No web app without it; the API works either way.
+    pub web_root: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for Http {
@@ -78,6 +81,7 @@ impl std::fmt::Debug for Http {
         f.debug_struct("Http")
             .field("listen", &self.listen)
             .field("token", &self.token.as_ref().map(|_| "***"))
+            .field("web_root", &self.web_root)
             .finish()
     }
 }

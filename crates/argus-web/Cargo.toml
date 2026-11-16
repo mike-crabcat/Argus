@@ -1,0 +1,47 @@
+[package]
+name = "argus-web"
+description = "The Argus browser app: live camera grid, WebCodecs decode, egui on WebGPU/WebGL2."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+argus-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "CloseEvent",
+    "CodecState",
+    "Document",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "HardwareAcceleration",
+    "Headers",
+    "HtmlCanvasElement",
+    "Location",
+    "MessageEvent",
+    "Performance",
+    "Request",
+    "RequestInit",
+    "Response",
+    "UrlSearchParams",
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "VideoFrame",
+    "WebSocket",
+    "Window",
+] }

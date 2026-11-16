@@ -16,7 +16,10 @@ local_budget_gb = 500
 #   tailscale serve --bg https / http://127.0.0.1:8080
 [http]
 listen = "127.0.0.1:8080"
-# token = "a long random string"   # then every request needs it
+# token = "a long random string"   # then every API request needs it;
+#                                  # open the app as https://host/?token=...
+# The browser app, built with scripts/build-web.sh:
+# web_root = "web/dist"
 
 # Optional: copy recordings to S3 or any S3-compatible store (MinIO,
 # Backblaze B2, Wasabi...). Without this section everything stays local.

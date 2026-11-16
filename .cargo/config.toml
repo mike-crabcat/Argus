@@ -1,0 +1,4 @@
+# WebCodecs (VideoDecoder, VideoFrame) and wgpu's VideoFrame upload are
+# behind web-sys's unstable-API flag.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

@@ -1,24 +1,13 @@
-//! HTTP API and live frame stream for the browser viewer.
+//! HTTP API, live frame stream and the browser app.
 //!
 //! * `GET /api/cameras`: cameras, their streams, codec strings and sizes.
-//! * `GET /api/live/{camera}/{stream}`: WebSocket. The server sends a text
-//!   message `{"type":"config", ...}` (codec string, size, and the
-//!   `avcC`/`hvcC` record as base64 for WebCodecs' `description`), then
-//!   binary frames, starting with a keyframe:
+//! * `GET /api/live/{camera}/{stream}`: WebSocket carrying the
+//!   [`argus_proto`] messages: a config text message, then binary frames
+//!   starting with a keyframe. The client may send pings to sync clocks.
+//! * Anything else: static files from `[http] web_root` (the browser app),
+//!   if configured. These need no token; the API does.
 //!
-//!   ```text
-//!   0      u8   kind: 1 = video access unit
-//!   1      u8   flags: bit 0 keyframe, bit 1 replay (cached GOP, sent so
-//!               decoding can start at once; display only the last one)
-//!   2..10  i64  pts, 90 kHz, big endian
-//!   10..18 i64  wall-clock time, µs since the Unix epoch, big endian
-//!   18..        the access unit: 4-byte length-prefixed NAL units
-//!   ```
-//!
-//!   A `{"type":"config"}` again means new parameters (reconfigure before the
-//!   next frame); `{"type":"discontinuity"}` means the camera reconnected.
-//!
-//! Auth: with a token configured, every request needs
+//! Auth: with a token configured, every API request needs
 //! `Authorization: Bearer <token>`, or `?token=<token>` (browsers can't set
 //! headers on WebSockets).
 //!
@@ -27,10 +16,12 @@
 //! cleanly and never holds up recording or other viewers.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use argus_proto::{ClientText, FrameHeader, ServerText};
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
@@ -55,14 +46,54 @@ pub const CLIENT_QUEUE: usize = 90;
 pub struct AppState {
     pub live: Arc<Live>,
     pub token: Option<Arc<str>>,
+    /// Directory with the built browser app, served at `/`.
+    pub web_root: Option<Arc<PathBuf>>,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/cameras", get(cameras))
         .route("/api/live/{camera}/{stream}", get(live_ws))
-        .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state)
+        .layer(middleware::from_fn_with_state(state.clone(), auth));
+    api.fallback(static_file).with_state(state)
+}
+
+/// Serves the browser app's files. Only plain relative paths inside
+/// `web_root` are served.
+async fn static_file(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
+    let Some(root) = &st.web_root else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let rel = uri.path().trim_start_matches('/');
+    let rel = if rel.is_empty() { "index.html" } else { rel };
+    let safe = rel
+        .split('/')
+        .all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains('\\'));
+    if !safe || rel.starts_with("api/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let content_type = match rel.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript",
+        Some("wasm") => "application/wasm",
+        Some("css") => "text/css",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    };
+    match tokio::fs::read(root.join(rel)).await {
+        Ok(body) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Serves until the listener fails or the task is aborted.
@@ -138,28 +169,36 @@ enum Out {
         frame: argus_media::Frame,
         replay: bool,
         received: Instant,
+        /// `received` on the wall clock, for the client's latency figure.
+        recv_us: i64,
     },
 }
 
-fn config_message(s: &LiveStream, v: &argus_media::VideoConfig) -> String {
-    json!({
-        "type": "config",
-        "camera": s.camera,
-        "stream": s.stream,
-        "codec": v.rfc6381,
-        "width": v.width,
-        "height": v.height,
-        "description": base64(v.decoder_record()),
-    })
-    .to_string()
+fn text(msg: &ServerText) -> String {
+    serde_json::to_string(msg).expect("serializable")
 }
 
-pub fn encode_frame(f: &argus_media::Frame, replay: bool) -> Bytes {
-    let mut b = BytesMut::with_capacity(18 + f.data.len());
-    b.put_u8(1);
-    b.put_u8(u8::from(f.keyframe) | (u8::from(replay) << 1));
-    b.put_i64(f.pts_90k);
-    b.put_i64(f.wall_us);
+fn config_message(s: &LiveStream, v: &argus_media::VideoConfig) -> String {
+    text(&ServerText::Config {
+        camera: s.camera.clone(),
+        stream: s.stream.clone(),
+        codec: v.rfc6381.clone(),
+        width: v.width,
+        height: v.height,
+        description: argus_proto::base64_encode(v.decoder_record()),
+    })
+}
+
+pub fn encode_frame(f: &argus_media::Frame, replay: bool, recv_us: i64) -> Bytes {
+    let h = FrameHeader {
+        keyframe: f.keyframe,
+        replay,
+        pts_90k: f.pts_90k,
+        wall_us: f.wall_us,
+        recv_us,
+    };
+    let mut b = BytesMut::with_capacity(argus_proto::HEADER_LEN + f.data.len());
+    b.put_slice(&h.encode());
     b.put_slice(&f.data);
     b.freeze()
 }
@@ -205,8 +244,10 @@ async fn viewer(socket: WebSocket, s: Arc<LiveStream>) {
                 let Some(out) = out else { break };
                 let res = match out {
                     Out::Text(t) => sink.send(Message::Text(t.into())).await,
-                    Out::Frame { frame, replay, received } => {
-                        let r = sink.send(Message::Binary(encode_frame(&frame, replay))).await;
+                    Out::Frame { frame, replay, received, recv_us } => {
+                        let r = sink
+                            .send(Message::Binary(encode_frame(&frame, replay, recv_us)))
+                            .await;
                         if !replay && stats.latency_us.len() < 1_000_000 {
                             stats.latency_us.push(received.elapsed().as_micros() as u32);
                         }
@@ -220,6 +261,14 @@ async fn viewer(socket: WebSocket, s: Arc<LiveStream>) {
             }
             msg = incoming.next() => match msg {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Text(t))) => {
+                    if let Ok(ClientText::Ping { client_us }) = serde_json::from_str(&t) {
+                        let pong = ServerText::Pong { client_us, server_us: crate::recorder::now_us() };
+                        if sink.send(Message::Text(text(&pong).into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
                 Some(Ok(_)) => {}
             },
         }
@@ -260,6 +309,7 @@ async fn feed(
             frame,
             replay: true,
             received: now,
+            recv_us: 0,
         }) {
             Ok(()) => need_key = false,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -283,6 +333,7 @@ async fn feed(
             Err(broadcast::error::RecvError::Closed) => return,
         };
         let received = Instant::now();
+        let recv_us = crate::recorder::now_us();
         match ev {
             StreamEvent::Config(c) => {
                 pending_config = Some(config_message(&s, &c));
@@ -308,6 +359,7 @@ async fn feed(
                     frame: f,
                     replay: false,
                     received,
+                    recv_us,
                 }) {
                     Ok(()) => need_key = false,
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -324,30 +376,11 @@ async fn feed(
             StreamEvent::Discontinuity => {
                 need_key = true;
                 replayed_until = None;
-                let _ = q.try_send(Out::Text(json!({"type": "discontinuity"}).to_string()));
+                let _ = q.try_send(Out::Text(text(&ServerText::Discontinuity)));
             }
             StreamEvent::AudioConfig(_) | StreamEvent::Audio(_) => {}
         }
     }
-}
-
-/// Standard base64 with padding.
-pub fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let n = (u32::from(c[0]) << 16)
-            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*c.get(2).unwrap_or(&0));
-        for i in 0..4 {
-            if i <= c.len() {
-                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 /// Keeps viewers' sockets from idling out behind proxies.
@@ -356,37 +389,6 @@ pub const PING_EVERY: Duration = Duration::from_secs(20);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64_matches_rfc4648() {
-        for (i, o) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64(i.as_bytes()), o);
-        }
-    }
-
-    #[test]
-    fn frame_header_layout() {
-        let f = argus_media::Frame {
-            pts_90k: 0x0102,
-            wall_us: -1,
-            keyframe: true,
-            data: Bytes::from_static(&[9, 9]),
-        };
-        let b = encode_frame(&f, true);
-        assert_eq!(b[0], 1);
-        assert_eq!(b[1], 0b11);
-        assert_eq!(&b[2..10], &0x0102i64.to_be_bytes());
-        assert_eq!(&b[10..18], &[0xff; 8]);
-        assert_eq!(&b[18..], &[9, 9]);
-    }
 
     #[test]
     fn token_compare() {

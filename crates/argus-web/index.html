@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Argus</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #0C0C0E; overflow: hidden; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+  #status { position: absolute; inset: 0; display: grid; place-items: center;
+            color: #5C5C64; font: 13.5px system-ui, sans-serif; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="argus"></canvas>
+<div id="status">Loading Argus…</div>
+<script type="module">
+  import init from "./argus_web.js";
+  init().catch((e) => {
+    document.getElementById("status").textContent = "Argus failed to load: " + e;
+  });
+</script>
+</body>
+</html>

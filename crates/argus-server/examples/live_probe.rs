@@ -44,9 +44,8 @@ async fn main() {
                 );
             }
             Message::Binary(b) => {
-                let key = b[1] & 1 != 0;
-                let is_replay = b[1] & 2 != 0;
-                let wall_us = i64::from_be_bytes(b[10..18].try_into().unwrap());
+                let (h, _) = argus_proto::parse_frame(&b).expect("frame");
+                let (key, is_replay, wall_us) = (h.keyframe, h.replay, h.wall_us);
                 if first_frame.is_none() {
                     first_frame = Some((start.elapsed(), key, is_replay));
                 }

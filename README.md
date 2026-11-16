@@ -46,6 +46,18 @@ person/vehicle/animal detections become events automatically
 argus -c argus.toml event add --camera driveway --from now-5m --to now
 ```
 
+### Browser app
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version <the wasm-bindgen version in Cargo.lock>
+scripts/build-web.sh                # -> web/dist
+```
+
+Set `web_root = "web/dist"` under `[http]` and open `http://127.0.0.1:8080/`
+(add `?token=...` if you set one). Browsers only decode video in a secure
+context, so from other machines use HTTPS, e.g. `tailscale serve`.
+
 ### Live view
 
 With an `[http]` section, `GET /api/cameras` lists cameras and
@@ -73,7 +85,9 @@ ARGUS_TOKEN=... cargo run --release --example live_probe -- \
 | `argus-media` | Frames, codec config, wall clock, fMP4 muxer |
 | `argus-store` | Chunk writer, GOP seek table, SQLite index, S3 uploader |
 | `argus-ingest` | RTSP and HTTP-FLV sources |
-| `argus-server` | Config, supervision, the `argus` binary |
+| `argus-server` | Config, supervision, HTTP API, the `argus` binary |
+| `argus-proto` | Live view wire protocol shared with the browser |
+| `argus-web` | Browser app: egui on WebGPU/WebGL2, WebCodecs |
 
 ## Develop
 
