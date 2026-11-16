@@ -35,6 +35,13 @@ impl WallClock {
         arrival_us
     }
 
+    /// Wall-clock time for `pts_90k` on the current anchor, without
+    /// anchoring or re-anchoring. Lets audio follow the video's timeline.
+    pub fn estimate(&self, pts_90k: i64) -> Option<i64> {
+        self.anchor
+            .map(|(apts, awall)| awall + (pts_90k - apts) * 100 / 9)
+    }
+
     /// How often the clock had to re-anchor; a health signal per camera.
     pub fn reanchors(&self) -> u64 {
         self.reanchors

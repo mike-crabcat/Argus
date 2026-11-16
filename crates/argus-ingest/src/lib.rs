@@ -5,7 +5,7 @@ pub mod flv;
 pub mod rtsp;
 
 use anyhow::{Result, bail};
-use argus_media::VideoConfig;
+use argus_media::{AudioConfig, VideoConfig};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
@@ -18,10 +18,21 @@ pub struct RawFrame {
     pub data: Bytes,
 }
 
+/// An audio frame as it comes off the wire. `pts_90k` is on the same clock
+/// as the video's, so both map to wall time through one anchor.
+#[derive(Clone, Debug)]
+pub struct RawAudio {
+    pub pts_90k: i64,
+    /// Raw AAC (no ADTS header).
+    pub data: Bytes,
+}
+
 #[derive(Clone, Debug)]
 pub enum SourceEvent {
     Config(VideoConfig),
     Frame(RawFrame),
+    AudioConfig(AudioConfig),
+    Audio(RawAudio),
 }
 
 /// Runs one connection to a camera stream until it ends or fails. The caller
