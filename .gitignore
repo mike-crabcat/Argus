@@ -1,3 +1,4 @@
 /target
 *.partial
 /data
+argus.toml
