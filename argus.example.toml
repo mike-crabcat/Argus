@@ -1,0 +1,22 @@
+# Argus configuration. Copy to argus.toml and edit.
+
+[storage]
+# Local hot tier: recordings, init segments and index.sqlite live here.
+root = "/var/lib/argus"
+# Each chunk object holds about this many seconds of one stream.
+chunk_seconds = 60
+
+# Reolink tips:
+#  * H.264 streams: prefer HTTP-FLV, Reolink's RTSP server is unreliable.
+#  * H.265 main streams (4K models) are only offered over RTSP.
+#  * Set "I-frame interval" to 1x the frame rate so seeks land within a second.
+
+[[camera]]
+name = "driveway"
+streams.main = "rtsp://admin:password@192.168.1.20:554/h265Preview_01_main"
+streams.sub = "http://192.168.1.20/flv?port=1935&app=bcs&stream=channel0_sub.bcs&user=admin&password=password"
+
+[[camera]]
+name = "front_door"
+streams.main = "http://192.168.1.21/flv?port=1935&app=bcs&stream=channel0_main.bcs&user=admin&password=password"
+streams.sub = "http://192.168.1.21/flv?port=1935&app=bcs&stream=channel0_sub.bcs&user=admin&password=password"

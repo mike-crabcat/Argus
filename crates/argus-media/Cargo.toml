@@ -1,0 +1,12 @@
+[package]
+name = "argus-media"
+description = "Media primitives for Argus: frames, codec config, wall clock mapping and a fragmented MP4 muxer."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
