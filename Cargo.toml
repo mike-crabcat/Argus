@@ -25,7 +25,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync", "signal", "time"] }
+object_store = { version = "0.14", features = ["aws"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
