@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use argus_server::config::Config;
 use argus_server::recorder::{self, StreamEvent};
-use argus_server::{s3, timearg};
+use argus_server::{reolink, s3, timearg, triggers};
 use argus_store::{ChunkWriter, Index, Uploader, upload};
 use clap::{Parser, Subcommand};
 use tokio::sync::broadcast;
@@ -45,6 +45,12 @@ enum EventCommand {
         #[arg(long, default_value = "manual")]
         label: String,
     },
+    /// Read each camera's motion/AI detections for a while and print what
+    /// they report, without recording or storing anything.
+    Watch {
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -75,7 +81,52 @@ async fn main() -> Result<()> {
             println!("event {id}: {camera} {from}..{to} ms ({label})");
             Ok(())
         }
+        Command::Event(EventCommand::Watch { seconds }) => watch(&cfg, seconds).await,
     }
+}
+
+async fn watch(cfg: &Config, seconds: u64) -> Result<()> {
+    let mut tasks = Vec::new();
+    for cam in &cfg.cameras {
+        let Some(ev) = cam.reolink_events()? else {
+            println!("{}: no camera events configured", cam.name);
+            continue;
+        };
+        let name = cam.name.clone();
+        let mut client = reolink::Client::new(&ev.base, &ev.user, &ev.password)?;
+        tasks.push(tokio::spawn(async move {
+            let end = tokio::time::Instant::now() + Duration::from_secs(seconds);
+            let mut polls = 0;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut supported = Vec::new();
+            let mut error = None;
+            while tokio::time::Instant::now() < end {
+                match client.detections().await {
+                    Ok(d) => {
+                        polls += 1;
+                        supported = d.supported.clone();
+                        seen.extend(d.active());
+                    }
+                    Err(e) => {
+                        error = Some(format!("{e:#}"));
+                        break;
+                    }
+                }
+                tokio::time::sleep(ev.poll).await;
+            }
+            client.logout().await;
+            match error {
+                Some(e) => println!("{name}: unavailable: {e}"),
+                None => println!(
+                    "{name}: {polls} polls, AI types supported: {supported:?}, active during watch: {seen:?}"
+                ),
+            }
+        }));
+    }
+    for t in tasks {
+        t.await?;
+    }
+    Ok(())
 }
 
 async fn run(cfg: Config) -> Result<()> {
@@ -111,6 +162,18 @@ async fn run(cfg: Config) -> Result<()> {
     info!(streams = ingest.len(), root = %cfg.storage.root.display(), "recording");
 
     let mut background = Vec::new();
+    for cam in &cfg.cameras {
+        let Some(ev) = cam.reolink_events()? else {
+            continue;
+        };
+        info!(camera = %cam.name, api = %ev.base, labels = ?ev.labels,
+              "events from camera detections");
+        let client = reolink::Client::new(&ev.base, &ev.user, &ev.password)?;
+        let t =
+            triggers::ReolinkTriggers::new(&cam.name, client, ev.hold, ev.labels, index.clone());
+        background.push(tokio::spawn(t.run(ev.poll)));
+    }
+
     if let Some(s3cfg) = &cfg.s3 {
         let store = s3::connect(s3cfg)?;
         let uploader = Uploader::new(

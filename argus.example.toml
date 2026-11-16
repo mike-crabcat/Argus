@@ -33,6 +33,13 @@ max_upload_mbps = 50
 # So by default the low-res sub stream is always in S3, and full resolution
 # only around events. Mark one by hand with:
 #   argus event add --camera driveway --from now-5m --to now
+#
+# Events also come from the cameras' own detections. Reolink cameras are
+# recognised from their stream URLs and polled read-only for person, vehicle
+# and animal detections, using the host and credentials in the stream URL.
+# Override per camera with [camera.events] (see front_door below), or turn
+# it off with: events = { source = "none" }. To see what each camera
+# reports: argus event watch --seconds 30
 
 # Reolink tips:
 #  * H.264 streams: prefer HTTP-FLV, Reolink's RTSP server is unreliable.
@@ -50,3 +57,12 @@ streams.main = "http://192.168.1.21/flv?port=1935&app=bcs&stream=channel0_main.b
 streams.sub = "http://192.168.1.21/flv?port=1935&app=bcs&stream=channel0_sub.bcs&user=admin&password=password"
 # Keep this camera's full resolution in S3 all the time.
 upload.main = "always"
+
+[camera.events]
+# source = "reolink"                 # or "none"
+# url = "http://192.168.1.21"        # default: the stream URL's host
+# user = "admin"                     # default: from the stream URL
+# password = "password"
+labels = ["person", "vehicle", "animal", "motion"]   # default: no motion
+poll_ms = 1000
+hold_ms = 5000                       # end an event 5 s after last detection

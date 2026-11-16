@@ -267,6 +267,35 @@ impl Index {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Moves an event's end (events are written as they happen and grow).
+    pub fn set_event_end(&self, id: i64, end_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE event SET end_ms = MAX(start_ms, ?2) WHERE id = ?1",
+            params![id, end_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Events on `camera` overlapping [from_ms, to_ms), oldest first, as
+    /// (start_ms, end_ms, source, label).
+    pub fn events(
+        &self,
+        camera: &str,
+        from_ms: i64,
+        to_ms: i64,
+    ) -> Result<Vec<(i64, i64, String, String)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT start_ms, end_ms, source, label FROM event
+              WHERE camera = ?1 AND end_ms >= ?2 AND start_ms < ?3 ORDER BY start_ms, id",
+        )?;
+        let rows = st
+            .query_map(params![camera, from_ms, to_ms], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Local chunks of one stream not yet uploaded, oldest first. With
     /// `event_pad_ms`, only those overlapping an event (widened by that much).
     pub fn pending_uploads(

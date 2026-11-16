@@ -35,10 +35,24 @@ sub streams around the clock (~1 TB/month) plus main-stream minutes around
 events.
 
 **Events** live in the index (`event`: camera, start, end, source, label).
-Today they come from `argus event add --camera X --from T --to T`; camera
-motion/AI triggers (Reolink) and Argus's own detection add rows later. An
-event added after the fact still works: its main-stream chunks are uploaded
-as long as they are still on local disk.
+They come from:
+
+* **The cameras' own detections.** For Reolink cameras Argus logs in to the
+  HTTP API (token in the URL, password only in the login body) and polls
+  `GetMdState` + `GetAiState` about once a second, read-only. An event opens
+  when a label (person, vehicle, animal; motion if enabled) goes active, is
+  written to the index immediately, and its end moves forward on every poll,
+  so main-stream chunks upload while it is still going on. It closes 5 s
+  after the detection was last seen. Settings are inferred from the stream
+  URLs (Reolink FLV/RTSP paths, host, credentials); `[camera.events]`
+  overrides them or turns them off. Each camera polls on its own with
+  backoff, so one being down doesn't affect the rest.
+* **By hand:** `argus event add --camera X --from T --to T`.
+* Later, Argus's own detection (phase 5).
+
+An event added after the fact still works: its main-stream chunks are
+uploaded as long as they are still on local disk. `argus event watch`
+shows what each camera reports, without recording.
 
 **State is all in the index.** `chunk.uploaded_at` and `remote` mark what is
 in S3 (same for `init_segment`), so after a restart the uploader resumes
@@ -61,8 +75,8 @@ objects in S3 (use a bucket lifecycle rule meanwhile).
 ## Phases
 
 1. **Record** (this crate set): RTSP + HTTP-FLV ingest, chunk writer, index.
-2. Blob storage: S3 upload by policy, local budget (done); events from
-   camera triggers, playback from S3, S3 retention (next).
+2. Blob storage: S3 upload by policy, local budget, events from camera
+   detections (done); playback from S3, S3 retention (next).
 3. Live viewer: WebTransport frame stream, egui/WebGPU grid.
 4. Synced replay: seek API, master clock, scrubbing, reverse.
 5. Detection: motion, ONNX object detection (NVDEC decode, no FFmpeg).
