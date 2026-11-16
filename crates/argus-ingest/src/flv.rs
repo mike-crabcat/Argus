@@ -18,16 +18,23 @@ pub async fn run(url: Url, tx: mpsc::Sender<SourceEvent>) -> Result<()> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(10))
         .build()?;
+    // reqwest errors embed the request URL, and Reolink puts the password in
+    // the query string, so every error drops the URL before it can be logged.
     let resp = client
         .get(url)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("FLV request")?
-        .error_for_status()?;
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?;
     let mut body = resp.bytes_stream();
     let mut parser = FlvParser::default();
     while let Some(chunk) = body.next().await {
-        for ev in parser.push(&chunk.context("FLV read")?)? {
+        let chunk = chunk
+            .map_err(reqwest::Error::without_url)
+            .context("FLV read")?;
+        for ev in parser.push(&chunk)? {
             if tx.send(ev).await.is_err() {
                 return Ok(());
             }
@@ -42,6 +49,10 @@ pub struct FlvParser {
     buf: BytesMut,
     header_done: bool,
     nal_length_size: usize,
+    /// Added to every FLV timestamp (in ms) to keep decode times strictly
+    /// increasing across duplicates and camera clock resets.
+    dts_offset_ms: i64,
+    last_dts_ms: Option<i64>,
 }
 
 const TAG_VIDEO: u8 = 9;
@@ -124,14 +135,34 @@ impl FlvParser {
                     return Ok(None); // no sequence header yet
                 }
                 let data = to_four_byte_lengths(payload, self.nal_length_size)?;
+                let dts_90k = self.monotonic_dts_90k(dts_ms);
                 Ok(Some(SourceEvent::Frame(RawFrame {
-                    pts_90k: (dts_ms + cts) * 90,
+                    pts_90k: dts_90k + cts * 90,
                     keyframe: frame_type == 1,
                     data,
                 })))
             }
             _ => Ok(None), // end of sequence
         }
+    }
+}
+
+impl FlvParser {
+    /// FLV timestamps are whole milliseconds and come straight from the
+    /// camera, which can repeat a value or jump backwards (clock reset,
+    /// 32-bit wrap). Shift such frames, and everything after them, so each
+    /// frame lands at least 1 ms after the previous one. The shift is
+    /// permanent, so later frames keep their spacing instead of piling up.
+    fn monotonic_dts_90k(&mut self, raw_ms: i64) -> i64 {
+        let mut dts = raw_ms + self.dts_offset_ms;
+        if let Some(last) = self.last_dts_ms {
+            if dts <= last {
+                self.dts_offset_ms += last + 1 - dts;
+                dts = last + 1;
+            }
+        }
+        self.last_dts_ms = Some(dts);
+        dts * 90
     }
 }
 
@@ -169,6 +200,50 @@ mod tests {
         let out =
             to_four_byte_lengths(Bytes::from_static(&[0, 2, 0xAA, 0xBB, 0, 1, 0xCC]), 2).unwrap();
         assert_eq!(&out[..], &[0, 0, 0, 2, 0xAA, 0xBB, 0, 0, 0, 1, 0xCC]);
+    }
+
+    #[test]
+    fn decode_times_strictly_increase() {
+        let mut p = FlvParser::default();
+        // Normal, duplicate, backwards (reset), then normal spacing again.
+        let got: Vec<i64> = [0, 50, 50, 100, 20, 70]
+            .iter()
+            .map(|&ms| p.monotonic_dts_90k(ms))
+            .collect();
+        assert_eq!(got, [0, 4500, 4590, 9090, 9180, 13680]);
+        assert!(got.windows(2).all(|w| w[1] > w[0]), "{got:?}");
+    }
+
+    async fn error_text(url: &str) -> String {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let err = run(Url::parse(url).unwrap(), tx).await.unwrap_err();
+        format!("{err:#} {err:?}")
+    }
+
+    #[tokio::test]
+    async fn connect_errors_do_not_leak_password() {
+        // Nothing listens on port 1, so the connect fails immediately.
+        let msg = error_text("http://127.0.0.1:1/flv?app=bcs&user=admin&password=secret").await;
+        assert!(msg.contains("FLV request"), "{msg}");
+        assert!(!msg.contains("secret"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn http_status_errors_do_not_leak_password() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        });
+        let msg = error_text(&format!("http://{addr}/flv?user=admin&password=secret")).await;
+        assert!(msg.contains("401"), "{msg}");
+        assert!(!msg.contains("secret"), "{msg}");
     }
 
     #[test]

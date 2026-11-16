@@ -70,4 +70,14 @@ mod tests {
         let r = super::redact("rtsp://admin:hunter2@10.0.0.5:554/h264Preview_01_main");
         assert!(!r.contains("hunter2") && !r.contains("admin"), "{r}");
     }
+
+    #[test]
+    fn redacts_reolink_flv_urls_from_config() {
+        let r = super::redact(
+            "http://192.168.100.193/flv?port=1935&app=bcs&stream=channel0_main.bcs&user=homeassistant&password=s3cr%26t%3D",
+        );
+        assert!(!r.contains("s3cr"), "{r}");
+        assert!(r.ends_with("password=***"), "{r}");
+        assert!(r.contains("stream=channel0_main.bcs"), "{r}");
+    }
 }
