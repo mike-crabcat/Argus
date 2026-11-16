@@ -14,6 +14,7 @@ argus-media = { path = "crates/argus-media" }
 argus-store = { path = "crates/argus-store" }
 argus-ingest = { path = "crates/argus-ingest" }
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }

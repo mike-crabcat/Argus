@@ -53,6 +53,14 @@ impl VideoConfig {
     pub fn fingerprint(&self) -> u64 {
         fnv1a(FNV_OFFSET, &self.sample_entry)
     }
+
+    /// The decoder configuration record (the body of the `avcC`/`hvcC` box):
+    /// what WebCodecs `VideoDecoderConfig.description` takes.
+    pub fn decoder_record(&self) -> &[u8] {
+        // VisualSampleEntry: 8-byte box header + 78 bytes of fields, then
+        // the config box's own 8-byte header.
+        self.sample_entry.get(8 + 78 + 8..).unwrap_or(&[])
+    }
 }
 
 /// AAC audio, stored exactly as the camera sent it. `sample_entry` is a
@@ -337,6 +345,13 @@ mod tests {
             stream_fingerprint(&v, Some(&a)),
             stream_fingerprint(&v, Some(&b))
         );
+    }
+
+    #[test]
+    fn decoder_record_is_the_avcc_body() {
+        let record = [1, 0x64, 0x00, 0x28, 0xff, 0xe0, 0x00];
+        let cfg = VideoConfig::from_avcc(&record, 1920, 1080).unwrap();
+        assert_eq!(cfg.decoder_record(), record);
     }
 
     #[test]

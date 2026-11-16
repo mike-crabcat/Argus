@@ -46,6 +46,17 @@ person/vehicle/animal detections become events automatically
 argus -c argus.toml event add --camera driveway --from now-5m --to now
 ```
 
+### Live view
+
+With an `[http]` section, `GET /api/cameras` lists cameras and
+`/api/live/{camera}/{stream}` streams live frames over WebSocket (see
+[docs/architecture.md](docs/architecture.md)). To try it:
+
+```sh
+ARGUS_TOKEN=... cargo run --release --example live_probe -- \
+  ws://127.0.0.1:8080/api/live/driveway/sub 10
+```
+
 ### Reolink cameras
 
 * Use the FLV URL for H.264 streams:

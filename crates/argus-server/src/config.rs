@@ -12,6 +12,8 @@ pub struct Config {
     pub storage: Storage,
     /// Object storage. Without it, recordings stay on local disk only.
     pub s3: Option<S3>,
+    /// The HTTP API and live view. Off without this section.
+    pub http: Option<Http>,
     #[serde(default, rename = "camera")]
     pub cameras: Vec<Camera>,
 }
@@ -56,6 +58,32 @@ impl std::fmt::Debug for S3 {
             .field("max_upload_mbps", &self.max_upload_mbps)
             .finish()
     }
+}
+
+/// `[http]`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Http {
+    /// Address to listen on. The default only accepts local connections;
+    /// put `tailscale serve` (which adds HTTPS) or another proxy in front.
+    #[serde(default = "default_listen")]
+    pub listen: std::net::SocketAddr,
+    /// If set, every request must carry it (`Authorization: Bearer ...` or
+    /// `?token=...`).
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for Http {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http")
+            .field("listen", &self.listen)
+            .field("token", &self.token.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
+fn default_listen() -> std::net::SocketAddr {
+    ([127, 0, 0, 1], 8080).into()
 }
 
 fn default_region() -> String {
@@ -535,6 +563,25 @@ mod tests {
         let no_creds =
             "[storage]\nroot='/tmp'\n[[camera]]\nname='c'\nstreams.main = 'http://h/flv?app=bcs'\n";
         assert!(Config::parse(no_creds).is_err());
+    }
+
+    #[test]
+    fn http_section() {
+        let cfg = Config::parse(
+            "[storage]\nroot='/tmp'\n[http]\nlisten = '0.0.0.0:9090'\ntoken = 'sekrit'\n",
+        )
+        .unwrap();
+        let h = cfg.http.as_ref().unwrap();
+        assert_eq!(h.listen.port(), 9090);
+        assert!(!format!("{cfg:?}").contains("sekrit"));
+        let d = Config::parse("[storage]\nroot='/tmp'\n[http]\n").unwrap();
+        assert_eq!(d.http.unwrap().listen.to_string(), "127.0.0.1:8080");
+        assert!(
+            Config::parse("[storage]\nroot='/tmp'\n")
+                .unwrap()
+                .http
+                .is_none()
+        );
     }
 
     #[test]
