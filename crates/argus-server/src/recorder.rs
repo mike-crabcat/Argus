@@ -72,7 +72,7 @@ pub async fn supervise(
     camera: String,
     stream: String,
     source: String,
-    out: broadcast::Sender<StreamEvent>,
+    out: std::sync::Arc<crate::live::LiveStream>,
 ) {
     let mut backoff = Duration::from_secs(1);
     let redacted = argus_ingest::redact(&source);
@@ -85,14 +85,14 @@ pub async fn supervise(
         let mut got_frames = false;
         while let Some(ev) = rx.recv().await {
             got_frames |= matches!(ev, SourceEvent::Frame(_));
-            let _ = out.send(ts.apply(ev, now_us()));
+            out.publish(ts.apply(ev, now_us()));
         }
         match conn.await {
             Ok(Ok(())) => return, // receiver closed: shutting down
             Ok(Err(e)) => warn!(%camera, %stream, "stream error: {e:#}"),
             Err(e) => warn!(%camera, %stream, "ingest task failed: {e}"),
         }
-        let _ = out.send(StreamEvent::Discontinuity);
+        out.publish(StreamEvent::Discontinuity);
         if got_frames {
             backoff = Duration::from_secs(1);
         }

@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use argus_server::config::Config;
-use argus_server::recorder::{self, StreamEvent};
-use argus_server::{reolink, s3, timearg, triggers};
+use argus_server::live::{Live, LiveStream};
+use argus_server::recorder;
+use argus_server::{http, reolink, s3, timearg, triggers};
 use argus_store::{ChunkWriter, Index, Uploader, upload};
 use clap::{Parser, Subcommand};
-use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 #[derive(Parser)]
@@ -138,9 +138,11 @@ async fn run(cfg: Config) -> Result<()> {
 
     let mut ingest = Vec::new();
     let mut recorders = Vec::new();
+    let mut live = Live::default();
     for cam in &cfg.cameras {
         for (stream, source) in &cam.streams {
-            let (tx, rx) = broadcast::channel::<StreamEvent>(1024);
+            let out = live.add(LiveStream::new(&cam.name, stream, 1024));
+            let rx = out.subscribe();
             let writer = ChunkWriter::new(
                 &cfg.storage.root,
                 &cam.name,
@@ -155,13 +157,29 @@ async fn run(cfg: Config) -> Result<()> {
                 cam.name.clone(),
                 stream.clone(),
                 source.clone(),
-                tx,
+                out,
             )));
         }
     }
     info!(streams = ingest.len(), root = %cfg.storage.root.display(), "recording");
+    let live = Arc::new(live);
 
     let mut background = Vec::new();
+    if let Some(h) = &cfg.http {
+        let listener = tokio::net::TcpListener::bind(h.listen)
+            .await
+            .with_context(|| format!("listening on {}", h.listen))?;
+        let state = http::AppState {
+            live: live.clone(),
+            token: h.token.as_deref().map(Arc::from),
+        };
+        info!(listen = %h.listen, auth = h.token.is_some(), "HTTP API and live view");
+        background.push(tokio::spawn(async move {
+            if let Err(e) = http::serve(listener, state).await {
+                warn!("HTTP server stopped: {e}");
+            }
+        }));
+    }
     for cam in &cfg.cameras {
         let Some(ev) = cam.reolink_events()? else {
             continue;
@@ -236,7 +254,10 @@ async fn run(cfg: Config) -> Result<()> {
     tokio::signal::ctrl_c().await?;
     info!("shutting down, closing open chunks");
     for t in background.iter().chain(&ingest) {
-        t.abort(); // ingest: drops each broadcast sender, which ends its recorder
+        t.abort();
+    }
+    for s in live.all() {
+        s.close(); // ends each recorder once it has written what it has
     }
     for r in recorders {
         r.await??;

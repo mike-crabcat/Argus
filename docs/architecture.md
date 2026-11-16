@@ -72,12 +72,50 @@ never deleted, so if S3 is unreachable for long the budget is exceeded
 Not yet: reading `remote` chunks back for playback, and deleting old
 objects in S3 (use a bucket lifecycle rule meanwhile).
 
+## Live view (phase 3)
+
+Every camera stream goes through a `LiveStream` fan-out: the recorder and
+any number of viewers subscribe to it. It keeps the current codec config
+and the frames since the last keyframe, so a new viewer starts decoding
+immediately (the cached GOP is marked "replay": decode it, show only the
+newest frame). Publishing never waits for subscribers.
+
+`[http]` turns on the HTTP API (default `127.0.0.1:8080`, optional bearer
+token, also accepted as `?token=` because browsers can't set headers on
+WebSockets):
+
+* `GET /api/cameras`: cameras, streams, codec strings, sizes, audio codec.
+* `GET /api/live/{camera}/{stream}`: WebSocket. A text message
+  `{"type":"config", codec, width, height, description}` (`description` is
+  the base64 `avcC`/`hvcC` record for WebCodecs), then binary frames: kind
+  (u8), flags (u8: keyframe, replay), pts (i64, 90 kHz), wall-clock µs
+  (i64), then the access unit as length-prefixed NAL units. Video only for
+  now.
+
+Each viewer has a bounded queue (90 frames). When it is full the viewer
+skips to the next keyframe, so a slow phone or a background tab never
+holds up recording or other viewers. When a viewer leaves, the server logs
+frames sent, frames dropped and send latency (receipt from the camera to
+the socket; tens of microseconds on a LAN).
+
+**Browsers need HTTPS.** WebCodecs only exists in secure contexts, so
+plain `http://100.x.y.z:8080` over Tailscale won't decode. Use
+`tailscale serve --bg https / http://127.0.0.1:8080`, which gives a real
+certificate for the machine's `*.ts.net` name and keeps Argus on
+localhost.
+
+**WebTransport** (lower latency, no head-of-line blocking) is planned as a
+second transport with the same messages. Safari has it since 26.4; for
+Tailscale the `tailscale cert` certificate can be used directly, since
+`tailscale serve` doesn't proxy QUIC.
+
 ## Phases
 
 1. **Record** (this crate set): RTSP + HTTP-FLV ingest, chunk writer, index.
 2. Blob storage: S3 upload by policy, local budget, events from camera
    detections (done); playback from S3, S3 retention (next).
-3. Live viewer: WebTransport frame stream, egui/WebGPU grid.
+3. Live viewer: WebSocket frame stream and API (done); browser app with
+   WebCodecs and egui/WebGPU grid, WebTransport (next).
 4. Synced replay: seek API, master clock, scrubbing, reverse.
 5. Detection: motion, ONNX object detection (NVDEC decode, no FFmpeg).
 6. Floor plans and the AI review agent.

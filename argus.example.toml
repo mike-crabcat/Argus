@@ -11,6 +11,13 @@ chunk_seconds = 60
 # A chunk still waiting to upload is never deleted.
 local_budget_gb = 500
 
+# Optional: the HTTP API and live view. Browsers need HTTPS for video
+# decoding, so keep this on localhost and put `tailscale serve` in front:
+#   tailscale serve --bg https / http://127.0.0.1:8080
+[http]
+listen = "127.0.0.1:8080"
+# token = "a long random string"   # then every request needs it
+
 # Optional: copy recordings to S3 or any S3-compatible store (MinIO,
 # Backblaze B2, Wasabi...). Without this section everything stays local.
 [s3]
