@@ -2,3 +2,4 @@
 *.partial
 /data
 argus.toml
+/web/dist

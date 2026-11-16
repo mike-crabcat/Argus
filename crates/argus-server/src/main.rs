@@ -172,6 +172,7 @@ async fn run(cfg: Config) -> Result<()> {
         let state = http::AppState {
             live: live.clone(),
             token: h.token.as_deref().map(Arc::from),
+            web_root: h.web_root.clone().map(Arc::new),
         };
         info!(listen = %h.listen, auth = h.token.is_some(), "HTTP API and live view");
         background.push(tokio::spawn(async move {

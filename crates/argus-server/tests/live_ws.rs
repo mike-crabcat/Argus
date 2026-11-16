@@ -32,11 +32,16 @@ fn frame(i: i64, size: usize) -> Frame {
 }
 
 async fn server() -> (String, Arc<LiveStream>) {
+    server_with(None).await
+}
+
+async fn server_with(web_root: Option<std::path::PathBuf>) -> (String, Arc<LiveStream>) {
     let mut live = Live::default();
     let s = live.add(LiveStream::new("door", "main", 1024));
     let state = AppState {
         live: Arc::new(live),
         token: Some(Arc::from(TOKEN)),
+        web_root: web_root.map(Arc::new),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -70,9 +75,11 @@ async fn next(ws: &mut Ws) -> Result<serde_json::Value, Bytes> {
 
 /// (frame index, keyframe, replay) of a binary frame message.
 fn parse(b: &[u8]) -> (i64, bool, bool) {
-    assert_eq!(b[0], 1);
-    let pts = i64::from_be_bytes(b[2..10].try_into().unwrap());
-    (pts / 9000, b[1] & 1 != 0, b[1] & 2 != 0)
+    let (h, au) = argus_proto::parse_frame(b).unwrap();
+    assert!(au.len() >= 5);
+    // Live frames carry the server's receive time; replayed ones don't.
+    assert_eq!(h.recv_us == 0, h.replay, "{h:?}");
+    (h.pts_90k / 9000, h.keyframe, h.replay)
 }
 
 #[tokio::test]
@@ -218,6 +225,66 @@ async fn rejects_requests_without_the_token() {
             .await
             .unwrap_err();
     assert!(err.to_string().contains("404"), "{err}");
+}
+
+#[tokio::test]
+async fn answers_pings_for_clock_sync() {
+    use futures::SinkExt;
+    let (addr, s) = server().await;
+    s.publish(StreamEvent::Config(config()));
+    let mut ws = connect(&addr).await;
+    assert_eq!(next(&mut ws).await.unwrap()["type"], "config");
+    let before = argus_server::recorder::now_us();
+    ws.send(Message::Text(r#"{"type":"ping","client_us":42}"#.into()))
+        .await
+        .unwrap();
+    let pong = next(&mut ws).await.unwrap();
+    assert_eq!(pong["type"], "pong");
+    assert_eq!(pong["client_us"], 42);
+    let server_us = pong["server_us"].as_i64().unwrap();
+    assert!(server_us >= before && server_us <= argus_server::recorder::now_us());
+}
+
+#[tokio::test]
+async fn serves_the_web_app_without_a_token() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.html"), "<!doctype html>argus").unwrap();
+    std::fs::write(dir.path().join("app.wasm"), [0, 97, 115, 109]).unwrap();
+    std::fs::write(dir.path().parent().unwrap().join("secret.txt"), "no").ok();
+    let (addr, _s) = server_with(Some(dir.path().to_owned())).await;
+    let (status, body) = reqwest_get(&format!("http://{addr}/"), None).await;
+    assert_eq!((status, body.as_str()), (200, "<!doctype html>argus"));
+    assert_eq!(
+        reqwest_get(&format!("http://{addr}/app.wasm"), None)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        reqwest_get(&format!("http://{addr}/missing.js"), None)
+            .await
+            .0,
+        404
+    );
+    // No escaping the web root, and the API still needs the token.
+    assert_eq!(
+        reqwest_get(&format!("http://{addr}/../secret.txt"), None)
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        reqwest_get(&format!("http://{addr}/%2e%2e/secret.txt"), None)
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        reqwest_get(&format!("http://{addr}/api/cameras"), None)
+            .await
+            .0,
+        401
+    );
 }
 
 /// Minimal HTTP GET (status, body) so the test needs no HTTP client crate.
