@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use argus_ingest::SourceEvent;
-use argus_media::{Frame, VideoConfig, WallClock};
+use argus_media::{AudioConfig, AudioFrame, Frame, VideoConfig, WallClock};
 use argus_store::ChunkWriter;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
@@ -15,6 +15,8 @@ use tracing::{info, warn};
 pub enum StreamEvent {
     Config(VideoConfig),
     Frame(Frame),
+    AudioConfig(AudioConfig),
+    Audio(AudioFrame),
     /// The source reconnected; timestamps restart.
     Discontinuity,
 }
@@ -26,10 +28,12 @@ pub fn now_us() -> i64 {
         .unwrap_or(0)
 }
 
-/// Assigns wall-clock times to raw frames.
+/// Assigns wall-clock times to raw frames. Audio uses the video's anchor,
+/// since both come from the same camera clock.
 #[derive(Default)]
 pub struct Timestamper {
     clock: WallClock,
+    audio_rate: Option<u32>,
 }
 
 impl Timestamper {
@@ -42,6 +46,22 @@ impl Timestamper {
                 keyframe: f.keyframe,
                 data: f.data,
             }),
+            SourceEvent::AudioConfig(c) => {
+                self.audio_rate = Some(c.sample_rate);
+                StreamEvent::AudioConfig(c)
+            }
+            SourceEvent::Audio(a) => {
+                let wall_us = match self.clock.estimate(a.pts_90k) {
+                    Some(t) => t,
+                    None => self.clock.map(a.pts_90k, arrival_us),
+                };
+                let rate = i64::from(self.audio_rate.unwrap_or(90_000));
+                StreamEvent::Audio(AudioFrame {
+                    pts: a.pts_90k * rate / 90_000,
+                    wall_us,
+                    data: a.data,
+                })
+            }
         }
     }
 }
@@ -88,6 +108,8 @@ pub fn record(mut rx: broadcast::Receiver<StreamEvent>, mut writer: ChunkWriter)
         let res = match rx.blocking_recv() {
             Ok(StreamEvent::Config(c)) => writer.on_config(&c),
             Ok(StreamEvent::Frame(f)) => writer.on_frame(f),
+            Ok(StreamEvent::AudioConfig(c)) => writer.on_audio_config(&c),
+            Ok(StreamEvent::Audio(a)) => writer.on_audio(a),
             Ok(StreamEvent::Discontinuity) => writer.on_discontinuity(),
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!("recorder fell behind, skipped {n} events");

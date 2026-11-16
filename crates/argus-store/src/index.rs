@@ -63,6 +63,13 @@ CREATE TABLE IF NOT EXISTS chunk (
 CREATE INDEX IF NOT EXISTS chunk_by_time ON chunk (camera, stream, start_ms);
 "#;
 
+/// Columns added after the first release, as (table, column, type). Added
+/// to existing databases on open.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    // RFC 6381 codec of the audio track, NULL for video-only init segments.
+    ("init_segment", "audio_rfc6381", "TEXT"),
+];
+
 impl Index {
     pub fn open(path: &Path) -> Result<Self> {
         Self::init(Connection::open(path)?)
@@ -74,6 +81,16 @@ impl Index {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        for (table, column, ty) in ADDED_COLUMNS {
+            let exists: bool = conn.query_row(
+                &format!("SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?1"),
+                [column],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
+            }
+        }
         Ok(Self { conn })
     }
 
@@ -85,12 +102,14 @@ impl Index {
         fingerprint: u64,
         object_key: &str,
         cfg: &argus_media::VideoConfig,
+        audio: Option<&argus_media::AudioConfig>,
     ) -> Result<i64> {
         let fp = format!("{fingerprint:016x}");
         self.conn.execute(
             "INSERT OR IGNORE INTO init_segment
-                 (camera, stream, fingerprint, object_key, codec, rfc6381, width, height)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (camera, stream, fingerprint, object_key, codec, rfc6381, width, height,
+                  audio_rfc6381)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 camera,
                 stream,
@@ -99,7 +118,8 @@ impl Index {
                 cfg.codec.as_str(),
                 cfg.rfc6381,
                 cfg.width,
-                cfg.height
+                cfg.height,
+                audio.map(|a| a.rfc6381.as_str())
             ],
         )?;
         Ok(self.conn.query_row(
@@ -198,14 +218,46 @@ mod tests {
     use argus_media::VideoConfig;
 
     #[test]
+    fn adds_audio_column_to_existing_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        // SCHEMA is the table layout as first released; the audio column
+        // only exists through ADDED_COLUMNS.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(SCHEMA)
+            .unwrap();
+        let has_column = |idx: &Index| -> bool {
+            idx.conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('init_segment') WHERE name = 'audio_rfc6381'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert!(!has_column(&Index {
+            conn: Connection::open(&path).unwrap()
+        }));
+        let idx = Index::open(&path).unwrap();
+        assert!(has_column(&idx));
+        let cfg = VideoConfig::from_avcc(&[1, 0x4d, 0, 0x1f, 0xff, 0xe0, 0], 640, 360).unwrap();
+        let audio = argus_media::AudioConfig::from_aac_asc(&[0x14, 0x08]).unwrap();
+        idx.upsert_init("c", "s", 1, "k", &cfg, Some(&audio))
+            .unwrap();
+        drop(idx);
+        Index::open(&path).unwrap(); // reopening is a no-op
+    }
+
+    #[test]
     fn seek_finds_gop_bytes() {
         let idx = Index::open_in_memory().unwrap();
         let cfg = VideoConfig::from_avcc(&[1, 0x4d, 0, 0x1f, 0xff, 0xe0, 0], 640, 360).unwrap();
         let init = idx
-            .upsert_init("drive", "sub", 42, "init/drive/sub/x.mp4", &cfg)
+            .upsert_init("drive", "sub", 42, "init/drive/sub/x.mp4", &cfg, None)
             .unwrap();
         assert_eq!(
-            idx.upsert_init("drive", "sub", 42, "init/drive/sub/x.mp4", &cfg)
+            idx.upsert_init("drive", "sub", 42, "init/drive/sub/x.mp4", &cfg, None)
                 .unwrap(),
             init
         );

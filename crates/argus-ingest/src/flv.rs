@@ -4,14 +4,15 @@
 //! same length-prefixed NAL units MP4 uses, so this is still passthrough.
 
 use anyhow::{Context, Result, bail};
-use argus_media::VideoConfig;
+use argus_media::{AudioConfig, VideoConfig};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::StreamExt;
 use h264_reader::avcc::AvcDecoderConfigurationRecord;
 use tokio::sync::mpsc;
+use tracing::debug;
 use url::Url;
 
-use crate::{RawFrame, SourceEvent};
+use crate::{RawAudio, RawFrame, SourceEvent};
 
 pub async fn run(url: Url, tx: mpsc::Sender<SourceEvent>) -> Result<()> {
     let client = reqwest::Client::builder()
@@ -43,20 +44,24 @@ pub async fn run(url: Url, tx: mpsc::Sender<SourceEvent>) -> Result<()> {
     bail!("FLV stream ended")
 }
 
-/// Incremental FLV demuxer that keeps only H.264 video.
+/// Incremental FLV demuxer that keeps H.264 video and AAC audio.
 #[derive(Default)]
 pub struct FlvParser {
     buf: BytesMut,
     header_done: bool,
     nal_length_size: usize,
-    /// Added to every FLV timestamp (in ms) to keep decode times strictly
-    /// increasing across duplicates and camera clock resets.
-    dts_offset_ms: i64,
-    last_dts_ms: Option<i64>,
+    video_ts: Monotonic,
+    audio_ts: Monotonic,
+    /// Whether an AAC sequence header has been accepted.
+    audio_ready: bool,
+    /// Whether unusable audio has already been logged (once per connection).
+    audio_skipped: bool,
 }
 
+const TAG_AUDIO: u8 = 8;
 const TAG_VIDEO: u8 = 9;
 const CODEC_AVC: u8 = 7;
+const SOUND_AAC: u8 = 10;
 
 impl FlvParser {
     pub fn push(&mut self, data: &[u8]) -> Result<Vec<SourceEvent>> {
@@ -94,11 +99,12 @@ impl FlvParser {
                 .split_to(11 + size + 4)
                 .freeze()
                 .slice(11..11 + size);
-            if tag_type == TAG_VIDEO {
-                if let Some(ev) = self.video_tag(ts, body)? {
-                    out.push(ev);
-                }
-            }
+            let ev = match tag_type {
+                TAG_VIDEO => self.video_tag(ts, body)?,
+                TAG_AUDIO => self.audio_tag(ts, body),
+                _ => None,
+            };
+            out.extend(ev);
         }
         Ok(out)
     }
@@ -135,7 +141,7 @@ impl FlvParser {
                     return Ok(None); // no sequence header yet
                 }
                 let data = to_four_byte_lengths(payload, self.nal_length_size)?;
-                let dts_90k = self.monotonic_dts_90k(dts_ms);
+                let dts_90k = self.video_ts.next_ms(dts_ms) * 90;
                 Ok(Some(SourceEvent::Frame(RawFrame {
                     pts_90k: dts_90k + cts * 90,
                     keyframe: frame_type == 1,
@@ -148,21 +154,64 @@ impl FlvParser {
 }
 
 impl FlvParser {
-    /// FLV timestamps are whole milliseconds and come straight from the
-    /// camera, which can repeat a value or jump backwards (clock reset,
-    /// 32-bit wrap). Shift such frames, and everything after them, so each
-    /// frame lands at least 1 ms after the previous one. The shift is
-    /// permanent, so later frames keep their spacing instead of piling up.
-    fn monotonic_dts_90k(&mut self, raw_ms: i64) -> i64 {
-        let mut dts = raw_ms + self.dts_offset_ms;
-        if let Some(last) = self.last_dts_ms {
-            if dts <= last {
-                self.dts_offset_ms += last + 1 - dts;
-                dts = last + 1;
+    /// AAC audio is passed through untouched. Anything else (G.711, MP3,
+    /// a bad AudioSpecificConfig) is skipped without affecting the video.
+    fn audio_tag(&mut self, ts_ms: i64, body: Bytes) -> Option<SourceEvent> {
+        let format = *body.first()? >> 4;
+        if format != SOUND_AAC {
+            self.skip_audio(&format!("FLV sound format {format} is not AAC"));
+            return None;
+        }
+        match *body.get(1)? {
+            0 => match AudioConfig::from_aac_asc(&body[2..]) {
+                Ok(cfg) => {
+                    self.audio_ready = true;
+                    Some(SourceEvent::AudioConfig(cfg))
+                }
+                Err(e) => {
+                    self.audio_ready = false;
+                    self.skip_audio(&e.to_string());
+                    None
+                }
+            },
+            1 if self.audio_ready => Some(SourceEvent::Audio(RawAudio {
+                pts_90k: self.audio_ts.next_ms(ts_ms) * 90,
+                data: body.slice(2..),
+            })),
+            _ => None,
+        }
+    }
+
+    fn skip_audio(&mut self, why: &str) {
+        if !self.audio_skipped {
+            self.audio_skipped = true;
+            debug!("not recording audio: {why}");
+        }
+    }
+}
+
+/// FLV timestamps are whole milliseconds and come straight from the camera,
+/// which can repeat a value or jump backwards (clock reset, 32-bit wrap).
+/// This shifts such a frame, and everything after it, so each frame lands at
+/// least 1 ms after the previous one. The shift is permanent, so later
+/// frames keep their spacing instead of piling up.
+#[derive(Default)]
+struct Monotonic {
+    offset_ms: i64,
+    last_ms: Option<i64>,
+}
+
+impl Monotonic {
+    fn next_ms(&mut self, raw_ms: i64) -> i64 {
+        let mut t = raw_ms + self.offset_ms;
+        if let Some(last) = self.last_ms {
+            if t <= last {
+                self.offset_ms += last + 1 - t;
+                t = last + 1;
             }
         }
-        self.last_dts_ms = Some(dts);
-        dts * 90
+        self.last_ms = Some(t);
+        t
     }
 }
 
@@ -204,11 +253,11 @@ mod tests {
 
     #[test]
     fn decode_times_strictly_increase() {
-        let mut p = FlvParser::default();
+        let mut m = Monotonic::default();
         // Normal, duplicate, backwards (reset), then normal spacing again.
         let got: Vec<i64> = [0, 50, 50, 100, 20, 70]
             .iter()
-            .map(|&ms| p.monotonic_dts_90k(ms))
+            .map(|&ms| m.next_ms(ms) * 90)
             .collect();
         assert_eq!(got, [0, 4500, 4590, 9090, 9180, 13680]);
         assert!(got.windows(2).all(|w| w[1] > w[0]), "{got:?}");
@@ -244,6 +293,56 @@ mod tests {
         let msg = error_text(&format!("http://{addr}/flv?user=admin&password=secret")).await;
         assert!(msg.contains("401"), "{msg}");
         assert!(!msg.contains("secret"), "{msg}");
+    }
+
+    /// FLV header + one tag per (type, ts_ms, body).
+    fn flv(tags: &[(u8, u32, &[u8])]) -> Vec<u8> {
+        let mut v = b"FLV\x01\x05\0\0\0\x09\0\0\0\0".to_vec();
+        for (kind, ts, body) in tags {
+            let n = body.len() as u32;
+            v.push(*kind);
+            v.extend_from_slice(&n.to_be_bytes()[1..]);
+            v.extend_from_slice(&ts.to_be_bytes()[1..]);
+            v.push((ts >> 24) as u8);
+            v.extend_from_slice(&[0; 3]);
+            v.extend_from_slice(body);
+            v.extend_from_slice(&(n + 11).to_be_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn passes_aac_through_and_skips_other_audio() {
+        let data = flv(&[
+            (TAG_AUDIO, 0, &[0xAF, 1, 9, 9]), // AAC frame before its config: dropped
+            (TAG_AUDIO, 0, &[0xAF, 0, 0x14, 0x08]),
+            (TAG_AUDIO, 64, &[0xAF, 1, 0x21, 0x10]),
+            (TAG_AUDIO, 64, &[0xAF, 1, 0x21, 0x11]), // duplicate timestamp
+            (TAG_AUDIO, 128, &[0x72, 0xD5]),         // G.711: ignored
+        ]);
+        let evs = FlvParser::default().push(&data).unwrap();
+        assert_eq!(evs.len(), 3, "{evs:?}");
+        let SourceEvent::AudioConfig(cfg) = &evs[0] else {
+            panic!("{evs:?}")
+        };
+        assert_eq!((cfg.sample_rate, cfg.channels), (16000, 1));
+        let audio: Vec<_> = evs[1..]
+            .iter()
+            .map(|e| match e {
+                SourceEvent::Audio(a) => (a.pts_90k, a.data.to_vec()),
+                e => panic!("{e:?}"),
+            })
+            .collect();
+        assert_eq!(
+            audio,
+            [(64 * 90, vec![0x21, 0x10]), (65 * 90, vec![0x21, 0x11])]
+        );
+    }
+
+    #[test]
+    fn bad_audio_config_does_not_stop_video() {
+        let data = flv(&[(TAG_AUDIO, 0, &[0xAF, 0, 0x2b, 0x92, 0x08, 0x00])]); // HE-AAC
+        assert!(FlvParser::default().push(&data).unwrap().is_empty());
     }
 
     #[test]

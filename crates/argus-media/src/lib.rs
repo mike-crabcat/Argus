@@ -10,7 +10,7 @@ pub mod fmp4;
 mod mp4box;
 
 pub use clock::WallClock;
-pub use config::{Codec, VideoConfig};
+pub use config::{AudioConfig, Codec, VideoConfig, stream_fingerprint};
 
 use bytes::Bytes;
 
@@ -35,4 +35,16 @@ impl Frame {
     pub fn wall_ms(&self) -> i64 {
         self.wall_us.div_euclid(1000)
     }
+}
+
+/// One encoded audio frame (an AAC access unit), untouched from the camera.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioFrame {
+    /// Presentation time in units of the stream's sample rate.
+    pub pts: i64,
+    /// Wall-clock time in microseconds since the Unix epoch, on the same
+    /// timeline as the video frames of the same stream.
+    pub wall_us: i64,
+    /// Raw AAC payload (no ADTS header).
+    pub data: Bytes,
 }

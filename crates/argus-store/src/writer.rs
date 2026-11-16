@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use argus_media::{Frame, VideoConfig, fmp4};
+use std::collections::VecDeque;
+
+use argus_media::fmp4::AudioRun;
+use argus_media::{AudioConfig, AudioFrame, Frame, VideoConfig, fmp4, stream_fingerprint};
 use tracing::{debug, info, warn};
 
 use crate::gop_index::GopEntry;
@@ -16,14 +19,27 @@ use crate::keys;
 /// Frames are buffered until the next keyframe arrives, then the whole GOP
 /// is written as one fragment. This buffering is for storage only: live
 /// viewers get frames straight from ingest without waiting for it.
+///
+/// Audio frames are buffered alongside, and each fragment takes the audio
+/// whose wall time falls before the next GOP starts. Audio that arrives late
+/// goes into the following fragment, still placed back to back on the audio
+/// track's timeline, so a GOP's byte range always holds its video and the
+/// audio around it.
 pub struct ChunkWriter {
     root: PathBuf,
     camera: String,
     stream: String,
     chunk_ms: i64,
     index: Arc<Mutex<Index>>,
+    video_config: Option<VideoConfig>,
+    audio_config: Option<AudioConfig>,
+    /// The init segment that fragments are currently written against.
     config: Option<ActiveConfig>,
     gop: Vec<Frame>,
+    audio: VecDeque<AudioFrame>,
+    /// Where the next audio fragment starts on the audio track, so audio
+    /// stays contiguous across fragments despite arrival jitter.
+    next_audio_dts: Option<u64>,
     open: Option<OpenChunk>,
     sequence: u32,
 }
@@ -57,53 +73,58 @@ impl ChunkWriter {
             stream: stream.to_owned(),
             chunk_ms: i64::from(chunk_secs.max(1)) * 1000,
             index,
+            video_config: None,
+            audio_config: None,
             config: None,
             gop: Vec::new(),
+            audio: VecDeque::new(),
+            next_audio_dts: None,
             open: None,
             sequence: 1,
         }
     }
 
-    /// New codec parameters. A real change closes the current chunk, since a
-    /// chunk only ever refers to one init segment.
+    /// New video parameters. A real change finishes the buffered GOP under
+    /// the old ones; the next fragment then starts a new init segment and
+    /// chunk, since a chunk only ever refers to one init segment.
     pub fn on_config(&mut self, cfg: &VideoConfig) -> Result<()> {
-        let fingerprint = cfg.fingerprint();
-        if self
-            .config
-            .as_ref()
-            .is_some_and(|c| c.fingerprint == fingerprint)
-        {
+        if self.video_config.as_ref() == Some(cfg) {
             return Ok(());
         }
         self.flush(None)?;
-        self.close_chunk()?;
-        let key = keys::init_key(&self.camera, &self.stream, fingerprint);
-        let path = self.root.join(&key);
-        if !path.exists() {
-            write_atomic(&path, &fmp4::init_segment(cfg))?;
+        self.video_config = Some(cfg.clone());
+        Ok(())
+    }
+
+    /// New audio parameters. Takes effect from the next fragment written
+    /// (which starts a new init segment if they changed). Buffered audio
+    /// from different old parameters is dropped rather than mislabelled.
+    pub fn on_audio_config(&mut self, cfg: &AudioConfig) -> Result<()> {
+        if self.audio_config.as_ref() == Some(cfg) {
+            return Ok(());
         }
-        let init_id = self.index.lock().unwrap().upsert_init(
-            &self.camera,
-            &self.stream,
-            fingerprint,
-            &key,
-            cfg,
-        )?;
-        info!(camera = %self.camera, stream = %self.stream, codec = %cfg.rfc6381,
-              width = cfg.width, height = cfg.height, "new init segment {key}");
-        self.config = Some(ActiveConfig {
-            fingerprint,
-            init_id,
-        });
+        if self.audio_config.is_some() {
+            self.audio.clear();
+            self.next_audio_dts = None;
+        }
+        self.audio_config = Some(cfg.clone());
+        Ok(())
+    }
+
+    pub fn on_audio(&mut self, frame: AudioFrame) -> Result<()> {
+        // Before the first keyframe there is no fragment to put it in.
+        if self.audio_config.is_some() && !self.gop.is_empty() {
+            self.audio.push_back(frame);
+        }
         Ok(())
     }
 
     pub fn on_frame(&mut self, frame: Frame) -> Result<()> {
-        if self.config.is_none() {
+        if self.video_config.is_none() {
             return Ok(()); // can't store frames we can't describe
         }
         if frame.keyframe && !self.gop.is_empty() {
-            self.flush(Some(frame.pts_90k))?;
+            self.flush(Some((frame.pts_90k, frame.wall_us)))?;
         }
         if self.gop.is_empty() && !frame.keyframe {
             return Ok(()); // waiting for the first keyframe
@@ -116,6 +137,8 @@ impl ChunkWriter {
     /// continuous, so finish the GOP and chunk we have.
     pub fn on_discontinuity(&mut self) -> Result<()> {
         self.flush(None)?;
+        self.audio.clear();
+        self.next_audio_dts = None;
         self.close_chunk()
     }
 
@@ -123,11 +146,19 @@ impl ChunkWriter {
         self.on_discontinuity()
     }
 
-    fn flush(&mut self, next_pts: Option<i64>) -> Result<()> {
+    /// Writes the buffered GOP. `next` is the (pts, wall time) of the
+    /// keyframe that starts the following GOP, when known.
+    fn flush(&mut self, next: Option<(i64, i64)>) -> Result<()> {
         if self.gop.is_empty() {
             return Ok(());
         }
+        self.use_current_config()?;
         let gop = std::mem::take(&mut self.gop);
+        let audio_end = match next {
+            Some((_, wall)) => self.audio.partition_point(|a| a.wall_us < wall),
+            None => self.audio.len(),
+        };
+        let audio: Vec<AudioFrame> = self.audio.drain(..audio_end).collect();
         let gop_start_ms = gop[0].wall_ms();
         if self.open.as_ref().is_some_and(|c| {
             gop_start_ms - c.start_ms >= self.chunk_ms || gop_start_ms < c.start_ms
@@ -138,12 +169,36 @@ impl ChunkWriter {
             self.open = Some(self.open_chunk(gop_start_ms)?);
         }
         let c = self.open.as_mut().unwrap();
-        let durations = fmp4::durations(&gop, next_pts);
+        let durations = fmp4::durations(&gop, next.map(|(pts, _)| pts));
         // Decode time is wall-clock time in 90 kHz ticks since the Unix epoch,
         // so every camera's fragments share one timeline and chunks can be
         // concatenated or fed to a player back to back.
         let base = u64::try_from(gop[0].wall_us).unwrap_or(0) * 9 / 100;
-        let frag = fmp4::fragment(self.sequence, base, &gop, &durations);
+        let audio_run = match (&self.audio_config, audio.first()) {
+            (Some(cfg), Some(first)) => {
+                // The audio track's decode time is wall-clock time in samples
+                // since the epoch, the same timeline as the video. Continue
+                // from the previous fragment unless that is off by more than
+                // half a second (a gap or a clock jump).
+                let rate = u64::from(cfg.sample_rate);
+                let wall = u64::try_from(first.wall_us).unwrap_or(0);
+                let from_wall = (u128::from(wall) * u128::from(rate) / 1_000_000) as u64;
+                let base = match self.next_audio_dts {
+                    Some(n) if n.abs_diff(from_wall) <= rate / 2 => n,
+                    _ => from_wall,
+                };
+                self.next_audio_dts =
+                    Some(base + audio.len() as u64 * u64::from(cfg.samples_per_frame));
+                Some(AudioRun {
+                    base_decode_time: base,
+                    frames: &audio,
+                    sample_duration: cfg.samples_per_frame,
+                })
+            }
+            _ => None,
+        };
+        let frag =
+            fmp4::fragment_with_audio(self.sequence, base, &gop, &durations, audio_run.as_ref());
         self.sequence = self.sequence.wrapping_add(1);
         c.file.write_all(&frag)?;
         let total: u64 = durations.iter().map(|&d| u64::from(d)).sum();
@@ -155,6 +210,48 @@ impl ChunkWriter {
         });
         c.bytes += frag.len() as u64;
         c.end_ms = c.end_ms.max(gop_start_ms + (total as i64) / 90);
+        Ok(())
+    }
+
+    /// Makes sure fragments are written against an init segment matching the
+    /// current video and audio configs, starting a new one (and a new chunk)
+    /// if they changed.
+    fn use_current_config(&mut self) -> Result<()> {
+        let cfg = self
+            .video_config
+            .clone()
+            .expect("frames are only buffered after a video config");
+        let audio = self.audio_config.clone();
+        let fingerprint = stream_fingerprint(&cfg, audio.as_ref());
+        if self
+            .config
+            .as_ref()
+            .is_some_and(|c| c.fingerprint == fingerprint)
+        {
+            return Ok(());
+        }
+        self.close_chunk()?;
+        let key = keys::init_key(&self.camera, &self.stream, fingerprint);
+        let path = self.root.join(&key);
+        if !path.exists() {
+            write_atomic(&path, &fmp4::init_segment(&cfg, audio.as_ref()))?;
+        }
+        let init_id = self.index.lock().unwrap().upsert_init(
+            &self.camera,
+            &self.stream,
+            fingerprint,
+            &key,
+            &cfg,
+            audio.as_ref(),
+        )?;
+        info!(camera = %self.camera, stream = %self.stream, codec = %cfg.rfc6381,
+              width = cfg.width, height = cfg.height,
+              audio = audio.as_ref().map_or("none", |a| a.rfc6381.as_str()),
+              "new init segment {key}");
+        self.config = Some(ActiveConfig {
+            fingerprint,
+            init_id,
+        });
         Ok(())
     }
 
@@ -268,5 +365,96 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(t.gop_start_ms, chunks[1].start_ms + 1000);
+    }
+
+    fn audio(i: i64) -> AudioFrame {
+        // 16 kHz AAC: 1024 samples = 64 ms.
+        AudioFrame {
+            pts: i * 1024,
+            wall_us: 1_700_000_000_000_000 + i * 64_000,
+            data: Bytes::from_static(&[0x21, 0x10, 0x04]),
+        }
+    }
+
+    #[test]
+    fn audio_goes_into_the_gop_it_belongs_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(Mutex::new(Index::open_in_memory().unwrap()));
+        let mut w = ChunkWriter::new(dir.path(), "cam", "main", 60, index.clone());
+        let cfg = VideoConfig::from_avcc(&[1, 0x4d, 0, 0x1f, 0xff, 0xe0, 0], 640, 360).unwrap();
+        w.on_config(&cfg).unwrap();
+        w.on_audio_config(&AudioConfig::from_aac_asc(&[0x14, 0x08]).unwrap())
+            .unwrap();
+        w.on_audio(audio(0)).unwrap(); // dropped: no keyframe yet
+        // 3 s of video in 1 s GOPs, audio interleaved by wall time.
+        let mut next_audio = 0;
+        for i in 0..30 {
+            let f = frame(i, i % 10 == 0);
+            while audio(next_audio).wall_us < f.wall_us {
+                w.on_audio(audio(next_audio)).unwrap();
+                next_audio += 1;
+            }
+            w.on_frame(f).unwrap();
+        }
+        w.finish().unwrap();
+        let chunks = index
+            .lock()
+            .unwrap()
+            .chunks_between("cam", "main", 0, i64::MAX)
+            .unwrap();
+        assert_eq!(chunks.len(), 1);
+        let bytes = std::fs::read(dir.path().join(&chunks[0].object_key)).unwrap();
+        // Count audio samples in each GOP's moof: the second traf's trun.
+        let per_gop: Vec<u32> = chunks[0]
+            .gops
+            .iter()
+            .map(|g| {
+                let frag = &bytes[g.byte_offset as usize..(g.byte_offset + g.byte_len) as usize];
+                let at = frag.windows(4).rposition(|w| w == b"trun").unwrap();
+                u32::from_be_bytes(frag[at + 8..at + 12].try_into().unwrap())
+            })
+            .collect();
+        // Audio 0..=15 start before the 1 s keyframe (15 * 64 ms = 960 ms),
+        // 16..=31 before 2 s; the last GOP takes what arrived before the
+        // final video frame at 2.9 s (32..=45).
+        assert_eq!(per_gop, [16, 16, 14]);
+        let fp = {
+            let a = AudioConfig::from_aac_asc(&[0x14, 0x08]).unwrap();
+            stream_fingerprint(&cfg, Some(&a))
+        };
+        assert!(dir.path().join(keys::init_key("cam", "main", fp)).exists());
+        assert!(
+            !dir.path()
+                .join(keys::init_key("cam", "main", cfg.fingerprint()))
+                .exists(),
+            "no video-only init segment should be written first"
+        );
+    }
+
+    #[test]
+    fn audio_config_change_starts_new_init_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(Mutex::new(Index::open_in_memory().unwrap()));
+        let mut w = ChunkWriter::new(dir.path(), "cam", "main", 60, index.clone());
+        let cfg = VideoConfig::from_avcc(&[1, 0x4d, 0, 0x1f, 0xff, 0xe0, 0], 640, 360).unwrap();
+        w.on_config(&cfg).unwrap();
+        w.on_audio_config(&AudioConfig::from_aac_asc(&[0x14, 0x08]).unwrap())
+            .unwrap();
+        for i in 0..20 {
+            w.on_frame(frame(i, i % 10 == 0)).unwrap();
+        }
+        w.on_audio_config(&AudioConfig::from_aac_asc(&[0x11, 0x90]).unwrap())
+            .unwrap();
+        for i in 20..40 {
+            w.on_frame(frame(i, i % 10 == 0)).unwrap();
+        }
+        w.finish().unwrap();
+        let chunks = index
+            .lock()
+            .unwrap()
+            .chunks_between("cam", "main", 0, i64::MAX)
+            .unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_ne!(chunks[0].init_id, chunks[1].init_id);
     }
 }
