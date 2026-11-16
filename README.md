@@ -38,7 +38,9 @@ To play a chunk locally: `cat init/.../X.mp4 rec/.../Y.m4s > clip.mp4`.
 
 With an `[s3]` section, closed chunks are also uploaded: the `sub` stream
 always, `main` only around events (see `argus.example.toml` and
-[docs/architecture.md](docs/architecture.md)). Mark an event by hand with:
+[docs/architecture.md](docs/architecture.md)). Reolink cameras' own
+person/vehicle/animal detections become events automatically
+(`argus event watch` shows what they report). Mark an event by hand with:
 
 ```sh
 argus -c argus.toml event add --camera driveway --from now-5m --to now
