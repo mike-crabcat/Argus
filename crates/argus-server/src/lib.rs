@@ -1,4 +1,5 @@
 pub mod config;
+pub mod devices;
 pub mod http;
 pub mod live;
 pub mod recorder;

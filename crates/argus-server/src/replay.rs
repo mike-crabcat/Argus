@@ -509,8 +509,10 @@ pub mod http {
     pub async fn replay_ws(
         State(st): State<AppState>,
         Query(q): Query<HashMap<String, String>>,
+        device: Option<axum::Extension<crate::http::DeviceId>>,
         ws: WebSocketUpgrade,
     ) -> Response {
+        let revoked = crate::http::until_revoked(&st, device);
         let rec = match recordings_or_404(&st) {
             Ok(r) => r.clone(),
             Err(e) => return *e,
@@ -520,8 +522,13 @@ pub mod http {
         let t = int(&q, "t").unwrap_or_else(|| crate::recorder::now_us() / 1000 - 60_000);
         let playing = !q.contains_key("paused");
         ws.on_upgrade(move |socket| async move {
-            if let Err(e) = session(socket, rec, cameras, stream, t, playing).await {
-                warn!("replay session ended: {e:#}");
+            tokio::select! {
+                r = session(socket, rec, cameras, stream, t, playing) => {
+                    if let Err(e) = r {
+                        warn!("replay session ended: {e:#}");
+                    }
+                }
+                _ = revoked => {}
             }
         })
     }

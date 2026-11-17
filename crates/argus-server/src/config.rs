@@ -74,6 +74,10 @@ pub struct Http {
     /// The built browser app (`web/dist` after `scripts/build-web.sh`),
     /// served at `/`. No web app without it; the API works either way.
     pub web_root: Option<std::path::PathBuf>,
+    /// The address phones open, e.g. `https://host.tailnet.ts.net:8444`.
+    /// Pairing QR codes point here; without it the viewer uses the address
+    /// it was opened at.
+    pub public_url: Option<String>,
 }
 
 impl std::fmt::Debug for Http {
@@ -82,6 +86,7 @@ impl std::fmt::Debug for Http {
             .field("listen", &self.listen)
             .field("token", &self.token.as_ref().map(|_| "***"))
             .field("web_root", &self.web_root)
+            .field("public_url", &self.public_url)
             .finish()
     }
 }

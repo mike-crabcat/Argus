@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 argus-proto.workspace = true
+qrcode = { version = "0.14", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 
