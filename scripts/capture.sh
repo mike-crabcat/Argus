@@ -13,6 +13,13 @@
 #
 # Needs: a built web app (scripts/build-web.sh), Node with Playwright
 # (npm i -g playwright, or NODE_PATH), and argus.toml in the repo root.
+#
+# To capture a server that is already running (e.g. the deployed one)
+# instead, set ARGUS_CAPTURE_URL=http://127.0.0.1:8080 and
+# ARGUS_CAPTURE_TOKEN_FILE=~/.config/argus/token.
+#
+# Chrome opens a window on the desktop when there is a display, so the real
+# GPU is used; set ARGUS_CAPTURE_HEADLESS=1 to stay headless.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,10 +29,9 @@ shift || true
 out="${ARGUS_CAPTURE_DIR:-$HOME/argus-captures}/$(date +%F)/$name"
 port=${ARGUS_CAPTURE_PORT:-18090}
 scratch=$(mktemp -d)
-trap 'kill -INT "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$scratch"' EXIT
+pid=
+trap '[ -n "$pid" ] && { kill -INT "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }; rm -rf "$scratch"' EXIT
 
-[ -f web/dist/index.html ] || { echo "build the web app first: scripts/build-web.sh" >&2; exit 1; }
-[ -f argus.toml ] || { echo "argus.toml not found" >&2; exit 1; }
 
 # Find Playwright: a normal install, NODE_PATH, or npx's cache.
 if ! node -e 'require.resolve("playwright")' 2>/dev/null; then
@@ -35,6 +41,21 @@ if ! node -e 'require.resolve("playwright")' 2>/dev/null; then
 fi
 node -e 'require.resolve("playwright")' 2>/dev/null || {
   echo "Playwright not found: npm i -g playwright (or set NODE_PATH)" >&2; exit 1; }
+
+if [ -n "${ARGUS_CAPTURE_URL:-}" ]; then
+  token=$(cat "${ARGUS_CAPTURE_TOKEN_FILE:?set ARGUS_CAPTURE_TOKEN_FILE}")
+  mkdir -p "$out"
+  node tools/capture/capture.mjs "$ARGUS_CAPTURE_URL/?token=$token" "$out" "$@"
+  if command -v ffmpeg >/dev/null && [ -f "$out/viewer.webm" ]; then
+    ffmpeg -v error -y -i "$out/viewer.webm" -c:v libx264 -preset veryfast -crf 26 \
+      -pix_fmt yuv420p -movflags +faststart "$out/viewer.mp4"
+  fi
+  ls -l "$out"
+  exit 0
+fi
+
+[ -f web/dist/index.html ] || { echo "build the web app first: scripts/build-web.sh" >&2; exit 1; }
+[ -f argus.toml ] || { echo "argus.toml not found" >&2; exit 1; }
 
 # A throwaway config: your cameras, a scratch root, the viewer on localhost
 # with a random token. No [s3]: nothing is uploaded.
