@@ -135,6 +135,35 @@ second transport with the same messages. Safari has it since 26.4; for
 Tailscale the `tailscale cert` certificate can be used directly, since
 `tailscale serve` doesn't proxy QUIC.
 
+## Synced replay (phase 4)
+
+Recorded fragments carry wall-clock decode times (90 kHz since the epoch),
+so frames from different cameras line up with no per-camera offset. The
+server reads them back out of the chunk files GOP by GOP using the index's
+byte ranges (`fmp4::read_video_samples`).
+
+* `GET /api/recordings?stream=sub&from=&to=`: recorded spans per camera.
+* `GET /api/seek?t=&stream=&cameras=`: per camera, the init segment and the
+  GOP containing `t` (chunk key, byte offset and length).
+* `GET /api/media/{key}`: init segments and chunks, with `Range`.
+* `GET /api/replay?t=&stream=&cameras=`: one WebSocket for every camera.
+  The server keeps a master clock and sends each camera's frames up to
+  800 ms ahead of it (binary kind 2: camera index, keyframe flag, pts,
+  wall µs, access unit). The client sends `seek` (with a sequence number,
+  echoed in the `replay` reply so stale frames are dropped), `play` and
+  `pause`. A seek starts every camera at the GOP containing the target.
+
+The browser decodes ahead and, on every repaint, shows for each camera the
+newest decoded frame whose wall time is not after its master clock, so all
+tiles show the same instant. If a decoder falls more than 8 frames behind
+(32 for the first 1.5 s after a seek, while it works through the GOP up to
+the target) it skips to the next keyframe rather than drift out of sync.
+The Replay switch in the top bar opens it; the timeline shows the last hour
+with recorded spans; Space plays/pauses, ←/→ jump 10 s.
+
+Not yet: replay of the main streams, chunks that are only in S3, speeds
+other than 1×, reverse, or scrubbing previews.
+
 ## Phases
 
 1. **Record** (this crate set): RTSP + HTTP-FLV ingest, chunk writer, index.
@@ -142,7 +171,9 @@ Tailscale the `tailscale cert` certificate can be used directly, since
    detections (done); playback from S3, S3 retention (next).
 3. Live viewer: WebSocket frame stream and API, browser grid with
    WebCodecs decode on egui/WebGPU (done); WebTransport, audio (next).
-4. Synced replay: seek API, master clock, scrubbing, reverse.
+4. Synced replay: seek API, replay stream with a master clock, timeline
+   with play/pause/seek (done); main streams, S3 chunks, speeds, reverse,
+   scrubbing (next).
 5. Detection: motion, ONNX object detection (NVDEC decode, no FFmpeg).
 6. Floor plans and the AI review agent.
 7. Polish: auth behind Tailscale, notifications, Frigate config import.

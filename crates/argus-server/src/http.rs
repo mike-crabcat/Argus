@@ -4,6 +4,13 @@
 //! * `GET /api/live/{camera}/{stream}`: WebSocket carrying the
 //!   [`argus_proto`] messages: a config text message, then binary frames
 //!   starting with a keyframe. The client may send pings to sync clocks.
+//! * `GET /api/recordings?stream=sub&from=MS&to=MS`: recorded spans per
+//!   camera, for a timeline.
+//! * `GET /api/seek?t=MS&stream=sub&cameras=a,b`: for each camera, the init
+//!   segment and the GOP containing `t` (chunk key and byte range).
+//! * `GET /api/media/{key}`: an init segment or chunk file, with `Range`.
+//! * `GET /api/replay?t=MS&stream=sub&cameras=a,b`: WebSocket, synced replay
+//!   of several cameras (see [`crate::replay`]).
 //! * Anything else: static files from `[http] web_root` (the browser app),
 //!   if configured. These need no token; the API does.
 //!
@@ -48,12 +55,24 @@ pub struct AppState {
     pub token: Option<Arc<str>>,
     /// Directory with the built browser app, served at `/`.
     pub web_root: Option<Arc<PathBuf>>,
+    /// Recordings, for replay. None disables the replay routes.
+    pub recordings: Option<Recordings>,
+}
+
+#[derive(Clone)]
+pub struct Recordings {
+    pub index: Arc<std::sync::Mutex<argus_store::Index>>,
+    pub root: Arc<PathBuf>,
 }
 
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/cameras", get(cameras))
         .route("/api/live/{camera}/{stream}", get(live_ws))
+        .route("/api/recordings", get(crate::replay::http::recordings))
+        .route("/api/seek", get(crate::replay::http::seek))
+        .route("/api/media/{*key}", get(crate::replay::http::media))
+        .route("/api/replay", get(crate::replay::http::replay_ws))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     api.fallback(static_file).with_state(state)
 }

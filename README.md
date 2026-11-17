@@ -58,6 +58,13 @@ Set `web_root = "web/dist"` under `[http]` and open `http://127.0.0.1:8080/`
 (add `?token=...` if you set one). Browsers only decode video in a secure
 context, so from other machines use HTTPS, e.g. `tailscale serve`.
 
+### Replay
+
+Click **Replay** in the viewer's top bar: all cameras play back together
+from a minute ago. Click the timeline to jump, Space to pause, ←/→ for
+10 s. The same data is available as `/api/recordings`, `/api/seek`,
+`/api/media/...` and the `/api/replay` WebSocket (see the architecture doc).
+
 ### Live view
 
 With an `[http]` section, `GET /api/cameras` lists cameras and

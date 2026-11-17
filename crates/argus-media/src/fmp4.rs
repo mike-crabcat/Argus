@@ -271,6 +271,99 @@ pub fn fragment_with_audio(
     b
 }
 
+/// One video sample read back from a fragment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sample {
+    /// Decode time in 90 kHz ticks. Argus writes wall-clock time since the
+    /// Unix epoch here, so this is also the frame's wall time.
+    pub dts_90k: u64,
+    pub duration: u32,
+    pub keyframe: bool,
+    pub data: bytes::Bytes,
+}
+
+/// Reads the video samples (track 1) of one `moof`+`mdat` fragment as
+/// [`fragment`] writes it: `tfhd` with default-base-is-moof, a version 1
+/// `tfdt`, and a `trun` with data offset, durations, sizes and flags.
+/// Returns `None` if the bytes aren't such a fragment.
+pub fn read_video_samples(frag: &bytes::Bytes) -> Option<Vec<Sample>> {
+    let be32 = |b: &[u8], i: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?))
+    };
+    let children = |b: &[u8]| -> Option<Vec<([u8; 4], std::ops::Range<usize>)>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 8 <= b.len() {
+            let len = be32(b, i)? as usize;
+            if len < 8 || i + len > b.len() {
+                return None;
+            }
+            out.push((b[i + 4..i + 8].try_into().ok()?, i + 8..i + len));
+            i += len;
+        }
+        Some(out)
+    };
+    let top = children(frag)?;
+    let (_, moof) = top.iter().find(|(t, _)| t == b"moof")?.clone();
+    let moof_start = moof.start - 8;
+    for (t, traf) in children(&frag[moof.clone()])? {
+        if &t != b"traf" {
+            continue;
+        }
+        let traf = &frag[moof.start + traf.start..moof.start + traf.end];
+        let kids = children(traf)?;
+        let body = |name: &[u8; 4]| {
+            kids.iter()
+                .find(|(t, _)| t == name)
+                .map(|(_, r)| &traf[r.clone()])
+        };
+        let tfhd = body(b"tfhd")?;
+        if be32(tfhd, 4)? != TRACK_ID {
+            continue;
+        }
+        let tfdt = body(b"tfdt")?;
+        let mut dts = match tfdt[0] {
+            1 => u64::from_be_bytes(tfdt.get(4..12)?.try_into().ok()?),
+            _ => u64::from(be32(tfdt, 4)?),
+        };
+        let trun = body(b"trun")?;
+        let flags = be32(trun, 0)? & 0x00ff_ffff;
+        if flags != 0x00_0701 {
+            return None; // not the layout Argus writes
+        }
+        let count = be32(trun, 4)? as usize;
+        let mut offset = moof_start + be32(trun, 8)? as usize;
+        let mut out = Vec::with_capacity(count);
+        for k in 0..count {
+            let e = 12 + k * 12;
+            let duration = be32(trun, e)?;
+            let size = be32(trun, e + 4)? as usize;
+            let sample_flags = be32(trun, e + 8)?;
+            if offset + size > frag.len() {
+                return None;
+            }
+            out.push(Sample {
+                dts_90k: dts,
+                duration,
+                keyframe: sample_flags & 0x0001_0000 == 0,
+                data: frag.slice(offset..offset + size),
+            });
+            offset += size;
+            dts += u64::from(duration);
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// The decoder configuration record (`avcC`/`hvcC` body) in an init
+/// segment, as WebCodecs' `description` wants it.
+pub fn decoder_record_from_init(init: &[u8]) -> Option<&[u8]> {
+    let i = init.windows(4).position(|w| w == b"avcC" || w == b"hvcC")?;
+    let len = u32::from_be_bytes(init.get(i - 4..i)?.try_into().ok()?) as usize;
+    init.get(i + 4..i - 4 + len)
+}
+
 /// Durations for a GOP from pts deltas. The last frame's duration comes from
 /// `next_pts` (the next GOP's keyframe) when known, else repeats the previous
 /// delta. Non-increasing timestamps (camera glitches) get a 1-tick duration
@@ -441,6 +534,54 @@ mod tests {
         let off = u32::from_be_bytes(trun[8..12].try_into().unwrap()) as usize;
         assert_eq!(off, moof_len + 8);
         assert_eq!(&frag[off..off + 3], &[0xAB; 3]);
+    }
+
+    #[test]
+    fn reads_back_the_video_samples_it_wrote() {
+        let frames = [
+            frame(0, true, 100),
+            frame(6000, false, 20),
+            frame(12000, false, 30),
+        ];
+        let audio = [AudioFrame {
+            pts: 0,
+            wall_us: 0,
+            data: Bytes::from_static(&[1, 2, 3]),
+        }];
+        let run = AudioRun {
+            base_decode_time: 5,
+            frames: &audio,
+            sample_duration: 1024,
+        };
+        let frag = Bytes::from(fragment_with_audio(
+            1,
+            1_000_000,
+            &frames,
+            &[6000, 6000, 6000],
+            Some(&run),
+        ));
+        let s = read_video_samples(&frag).unwrap();
+        assert_eq!(
+            s.iter()
+                .map(|s| (s.dts_90k, s.keyframe, s.data.len()))
+                .collect::<Vec<_>>(),
+            [
+                (1_000_000, true, 100),
+                (1_006_000, false, 20),
+                (1_012_000, false, 30)
+            ]
+        );
+        assert!(s.iter().all(|s| s.data.iter().all(|&b| b == 0xAB)));
+        assert!(read_video_samples(&Bytes::from_static(b"garbage!")).is_none());
+    }
+
+    #[test]
+    fn finds_the_decoder_record_in_an_init_segment() {
+        let record = [1, 0x4d, 0, 0x1f, 0xff, 0xe0, 0];
+        let cfg = VideoConfig::from_avcc(&record, 640, 360).unwrap();
+        let audio = AudioConfig::from_aac_asc(&[0x14, 0x08]).unwrap();
+        let init = init_segment(&cfg, Some(&audio));
+        assert_eq!(decoder_record_from_init(&init), Some(&record[..]));
     }
 
     #[test]

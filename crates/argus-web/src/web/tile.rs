@@ -78,7 +78,7 @@ pub struct Tile {
     _on_error: Closure<dyn FnMut(JsValue)>,
 }
 
-struct Texture {
+pub(crate) struct Texture {
     texture: wgpu::Texture,
     id: egui::TextureId,
     size: (u32, u32),
@@ -235,30 +235,7 @@ impl Tile {
             frame.close();
             return;
         }
-        if self.texture.as_ref().is_none_or(|t| t.size != size) {
-            self.texture = Some(new_texture(rs, size, self.texture.as_ref().map(|t| t.id)));
-        }
-        let tex = self.texture.as_ref().unwrap();
-        rs.queue.copy_external_image_to_texture(
-            &wgpu::CopyExternalImageSourceInfo {
-                source: wgpu::ExternalImageSource::VideoFrame(Clone::clone(&frame)),
-                origin: wgpu::Origin2d::ZERO,
-                flip_y: false,
-            },
-            wgpu::CopyExternalImageDestInfo {
-                texture: &tex.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-                color_space: wgpu::PredefinedColorSpace::Srgb,
-                premultiplied_alpha: false,
-            },
-            wgpu::Extent3d {
-                width: size.0,
-                height: size.1,
-                depth_or_array_layers: 1,
-            },
-        );
+        upload(rs, &mut self.texture, &frame, size);
         self.in_flight = Some(frame);
         let mut sh = self.shared.borrow_mut();
         sh.size = Some(size);
@@ -328,6 +305,74 @@ impl Drop for Tile {
     }
 }
 
+/// Copies a decoded frame into `texture` (created or resized as needed).
+/// wgpu performs the copy at the next queue submit, so the caller must keep
+/// `frame` open until then.
+pub(crate) fn upload(
+    rs: &RenderState,
+    texture: &mut Option<Texture>,
+    frame: &VideoFrame,
+    size: (u32, u32),
+) {
+    if texture.as_ref().is_none_or(|t| t.size != size) {
+        *texture = Some(new_texture(rs, size, texture.as_ref().map(|t| t.id)));
+    }
+    let tex = texture.as_ref().unwrap();
+    rs.queue.copy_external_image_to_texture(
+        &wgpu::CopyExternalImageSourceInfo {
+            source: wgpu::ExternalImageSource::VideoFrame(Clone::clone(frame)),
+            origin: wgpu::Origin2d::ZERO,
+            flip_y: false,
+        },
+        wgpu::CopyExternalImageDestInfo {
+            texture: &tex.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+            color_space: wgpu::PredefinedColorSpace::Srgb,
+            premultiplied_alpha: false,
+        },
+        wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+impl Texture {
+    pub(crate) fn id_and_size(&self) -> (egui::TextureId, (u32, u32)) {
+        (self.id, self.size)
+    }
+
+    pub(crate) fn free(self, rs: &RenderState) {
+        rs.renderer.write().free_texture(&self.id);
+    }
+}
+
+/// Configures a WebCodecs decoder from a config message.
+pub(crate) fn configure(
+    dec: &VideoDecoder,
+    codec: &str,
+    width: u16,
+    height: u16,
+    description: &str,
+) -> Result<(), String> {
+    let cfg = VideoDecoderConfig::new(codec);
+    if let Some(desc) = argus_proto::base64_decode(description) {
+        cfg.set_description(&Uint8Array::from(&desc[..]));
+    }
+    cfg.set_coded_width(u32::from(width));
+    cfg.set_coded_height(u32::from(height));
+    // "no-preference" uses the GPU decoder when there is one;
+    // "prefer-hardware" is rejected outright where there isn't
+    // (headless browsers, some VMs), so it would show nothing.
+    cfg.set_hardware_acceleration(HardwareAcceleration::NoPreference);
+    cfg.set_optimize_for_latency(true);
+    dec.configure(&cfg)
+        .map_err(|e| format!("unsupported codec {codec}: {}", js_message(&e)))
+}
+
 fn new_texture(rs: &RenderState, size: (u32, u32), reuse: Option<egui::TextureId>) -> Texture {
     let texture = rs.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("camera"),
@@ -379,31 +424,18 @@ fn on_text(s: &Rc<RefCell<Shared>>, text: &str) {
             let Some(dec) = sh.decoder.clone() else {
                 return;
             };
-            let cfg = VideoDecoderConfig::new(&codec);
-            if let Some(desc) = argus_proto::base64_decode(&description) {
-                cfg.set_description(&Uint8Array::from(&desc[..]));
-            }
-            cfg.set_coded_width(u32::from(width));
-            cfg.set_coded_height(u32::from(height));
-            // "no-preference" uses the GPU decoder when there is one;
-            // "prefer-hardware" is rejected outright where there isn't
-            // (headless browsers, some VMs), so it would show nothing.
-            cfg.set_hardware_acceleration(HardwareAcceleration::NoPreference);
-            cfg.set_optimize_for_latency(true);
-            match dec.configure(&cfg) {
+            match configure(&dec, &codec, width, height, &description) {
                 Ok(()) => {
                     sh.configured = true;
                     sh.waiting_key = true;
                     sh.codec = Some(codec);
                     sh.status = Status::Live;
                 }
-                Err(e) => {
-                    sh.status =
-                        Status::Error(format!("unsupported codec {codec}: {}", js_message(&e)))
-                }
+                Err(e) => sh.status = Status::Error(e),
             }
         }
         ServerText::Discontinuity => sh.waiting_key = true,
+        ServerText::Replay { .. } => {} // replay socket only
         ServerText::Pong {
             client_us,
             server_us,

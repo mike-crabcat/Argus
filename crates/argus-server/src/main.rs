@@ -173,6 +173,10 @@ async fn run(cfg: Config) -> Result<()> {
             live: live.clone(),
             token: h.token.as_deref().map(Arc::from),
             web_root: h.web_root.clone().map(Arc::new),
+            recordings: Some(http::Recordings {
+                index: index.clone(),
+                root: Arc::new(cfg.storage.root.clone()),
+            }),
         };
         info!(listen = %h.listen, auth = h.token.is_some(), "HTTP API and live view");
         background.push(tokio::spawn(async move {

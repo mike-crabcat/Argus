@@ -433,6 +433,88 @@ impl Index {
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    /// Codec string and size recorded for an init segment, by object key.
+    pub fn init_info(&self, object_key: &str) -> Result<Option<(String, u16, u16)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT rfc6381, width, height FROM init_segment WHERE object_key = ?1",
+                [object_key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Chunks on local disk ending after `from_ms`, oldest first, with their
+    /// init segment keys: what replay reads from.
+    pub fn local_chunks_from(
+        &self,
+        camera: &str,
+        stream: &str,
+        from_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(ChunkRecord, String)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT c.camera, c.stream, c.start_ms, c.end_ms, c.object_key, c.bytes, c.init_id,
+                    c.gop_index, i.object_key
+               FROM chunk c JOIN init_segment i ON i.id = c.init_id
+              WHERE c.camera = ?1 AND c.stream = ?2 AND c.end_ms > ?3 AND c.tier = 'local'
+              ORDER BY c.start_ms LIMIT ?4",
+        )?;
+        let rows = st.query_map(
+            params![
+                camera,
+                stream,
+                from_ms,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |r| {
+                Ok((
+                    ChunkRecord {
+                        camera: r.get(0)?,
+                        stream: r.get(1)?,
+                        start_ms: r.get(2)?,
+                        end_ms: r.get(3)?,
+                        object_key: r.get(4)?,
+                        bytes: r.get::<_, i64>(5)? as u64,
+                        init_id: r.get(6)?,
+                        gops: gop_index::decode(&r.get::<_, Vec<u8>>(7)?),
+                    },
+                    r.get(8)?,
+                ))
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Recorded spans of a stream within [from_ms, to_ms), as (start, end),
+    /// merging chunks less than `gap_ms` apart. For drawing a timeline.
+    pub fn coverage(
+        &self,
+        camera: &str,
+        stream: &str,
+        from_ms: i64,
+        to_ms: i64,
+        gap_ms: i64,
+    ) -> Result<Vec<(i64, i64)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT start_ms, end_ms FROM chunk
+              WHERE camera = ?1 AND stream = ?2 AND end_ms > ?3 AND start_ms < ?4
+                AND tier != 'discarded' ORDER BY start_ms",
+        )?;
+        let mut spans: Vec<(i64, i64)> = Vec::new();
+        for row in st.query_map(params![camera, stream, from_ms, to_ms], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (a, b) = row?;
+            match spans.last_mut() {
+                Some(last) if a - last.1 < gap_ms => last.1 = last.1.max(b),
+                _ => spans.push((a, b)),
+            }
+        }
+        Ok(spans)
+    }
 }
 
 #[cfg(test)]
@@ -470,6 +552,45 @@ mod tests {
             .unwrap();
         drop(idx);
         Index::open(&path).unwrap(); // reopening is a no-op
+    }
+
+    #[test]
+    fn coverage_merges_adjacent_chunks_and_replay_reads_local_ones() {
+        let idx = Index::open_in_memory().unwrap();
+        let cfg = VideoConfig::from_avcc(&[1, 0x4d, 0, 0x1f, 0xff, 0xe0, 0], 640, 360).unwrap();
+        let init = idx
+            .upsert_init("c", "s", 1, "init/c/s/1.mp4", &cfg, None)
+            .unwrap();
+        for (i, (a, b)) in [(0, 60_000), (60_500, 120_000), (300_000, 360_000)]
+            .into_iter()
+            .enumerate()
+        {
+            idx.insert_chunk(&ChunkRecord {
+                camera: "c".into(),
+                stream: "s".into(),
+                start_ms: a,
+                end_ms: b,
+                object_key: format!("rec/{i}"),
+                bytes: 1,
+                init_id: init,
+                gops: vec![],
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            idx.coverage("c", "s", 0, i64::MAX, 2000).unwrap(),
+            [(0, 120_000), (300_000, 360_000)]
+        );
+        let ids = idx.local_chunks_oldest_first(None, 10).unwrap();
+        idx.set_tier(ids[1].id, tier::REMOTE).unwrap();
+        let local = idx.local_chunks_from("c", "s", 30_000, 10).unwrap();
+        assert_eq!(
+            local
+                .iter()
+                .map(|(c, init)| (c.object_key.as_str(), init.as_str()))
+                .collect::<Vec<_>>(),
+            [("rec/0", "init/c/s/1.mp4"), ("rec/2", "init/c/s/1.mp4")]
+        );
     }
 
     #[test]

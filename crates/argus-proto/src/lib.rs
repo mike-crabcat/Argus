@@ -11,6 +11,62 @@ use serde::{Deserialize, Serialize};
 /// Binary message kind: one video access unit.
 pub const KIND_VIDEO: u8 = 1;
 
+/// Binary message kind: one recorded video access unit on the replay
+/// socket, for one of several cameras. See [`ReplayHeader`].
+pub const KIND_REPLAY_VIDEO: u8 = 2;
+
+/// Bytes before the access unit in a replay video message.
+pub const REPLAY_HEADER_LEN: usize = 19;
+
+/// Header of a binary replay message:
+///
+/// ```text
+/// 0      u8   kind (2 = replay video)
+/// 1      u8   flags: bit 0 keyframe
+/// 2      u8   camera: index into the latest `replay` message's list
+/// 3..11  i64  pts, 90 kHz (the recorded decode time)
+/// 11..19 i64  wall-clock time of the frame, µs since the Unix epoch
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayHeader {
+    pub camera: u8,
+    pub keyframe: bool,
+    pub pts_90k: i64,
+    pub wall_us: i64,
+}
+
+impl ReplayHeader {
+    pub fn encode(&self) -> [u8; REPLAY_HEADER_LEN] {
+        let mut b = [0u8; REPLAY_HEADER_LEN];
+        b[0] = KIND_REPLAY_VIDEO;
+        b[1] = u8::from(self.keyframe);
+        b[2] = self.camera;
+        b[3..11].copy_from_slice(&self.pts_90k.to_be_bytes());
+        b[11..19].copy_from_slice(&self.wall_us.to_be_bytes());
+        b
+    }
+}
+
+/// Splits a binary replay message into its header and access unit.
+pub fn parse_replay_frame(msg: &[u8]) -> Result<(ReplayHeader, &[u8]), ParseError> {
+    if msg.len() < REPLAY_HEADER_LEN {
+        return Err(ParseError::TooShort);
+    }
+    if msg[0] != KIND_REPLAY_VIDEO {
+        return Err(ParseError::UnknownKind(msg[0]));
+    }
+    let i = |r: std::ops::Range<usize>| i64::from_be_bytes(msg[r].try_into().unwrap());
+    Ok((
+        ReplayHeader {
+            keyframe: msg[1] & 1 != 0,
+            camera: msg[2],
+            pts_90k: i(3..11),
+            wall_us: i(11..19),
+        },
+        &msg[REPLAY_HEADER_LEN..],
+    ))
+}
+
 /// Bytes before the access unit in a video message.
 pub const HEADER_LEN: usize = 26;
 
@@ -104,13 +160,32 @@ pub enum ServerText {
         client_us: i64,
         server_us: i64,
     },
+    /// Replay socket: playback (re)starts at `t_ms` for these cameras.
+    /// Binary frames that follow refer to cameras by index in this list;
+    /// frames received before it belong to an earlier `seq` and are stale.
+    Replay {
+        seq: u32,
+        t_ms: i64,
+        playing: bool,
+        cameras: Vec<String>,
+    },
 }
 
 /// Text messages from the client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientText {
-    Ping { client_us: i64 },
+    Ping {
+        client_us: i64,
+    },
+    /// Replay: jump to `t_ms`; the server answers with a `replay` message
+    /// carrying the same `seq`.
+    Seek {
+        t_ms: i64,
+        seq: u32,
+    },
+    Play,
+    Pause,
 }
 
 /// Estimates `server clock - client clock` from ping/pong round trips,
@@ -214,6 +289,34 @@ mod tests {
             }
             .pts_us(),
             1_000_000
+        );
+    }
+
+    #[test]
+    fn replay_header_roundtrip() {
+        let h = ReplayHeader {
+            camera: 3,
+            keyframe: true,
+            pts_90k: 1_800_000_000 * 90,
+            wall_us: 1_800_000_000_000_000,
+        };
+        let mut msg = h.encode().to_vec();
+        msg.push(7);
+        let (back, au) = parse_replay_frame(&msg).unwrap();
+        assert_eq!((back, au), (h, &[7u8][..]));
+        assert!(parse_frame(&msg).is_err());
+        let seek: ClientText = serde_json::from_str(r#"{"type":"seek","t_ms":5,"seq":2}"#).unwrap();
+        assert_eq!(seek, ClientText::Seek { t_ms: 5, seq: 2 });
+        let r = serde_json::to_string(&ServerText::Replay {
+            seq: 2,
+            t_ms: 5,
+            playing: true,
+            cameras: vec!["door".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            r,
+            r#"{"type":"replay","seq":2,"t_ms":5,"playing":true,"cameras":["door"]}"#
         );
     }
 
