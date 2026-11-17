@@ -148,6 +148,20 @@ impl App {
         }
     }
 
+    /// Shows camera `f` full window on its main stream (live or replay), or
+    /// goes back to the grid.
+    fn set_focus(&mut self, f: Option<usize>) {
+        if let Some(r) = &mut self.replay {
+            if let Some(old) = self.focus.filter(|o| Some(*o) != f) {
+                r.set_stream(old, "sub");
+            }
+            if let Some(new) = f {
+                r.set_stream(new, "main");
+            }
+        }
+        self.focus = f;
+    }
+
     fn start_replay(&mut self, ctx: &egui::Context, rs: &RenderState, t_ms: f64) {
         for t in self.tiles.iter_mut() {
             t.release(rs);
@@ -705,7 +719,7 @@ impl eframe::App for App {
             r.update(&rs);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.focus = None;
+            self.set_focus(None);
         }
         self.publish_stats();
 
@@ -741,7 +755,7 @@ impl eframe::App for App {
                     self.tiles.len()
                 };
                 let mut rects = Vec::new();
-                match self.focus.filter(|&i| i < n && self.replay.is_none()) {
+                match self.focus.filter(|&i| i < n) {
                     Some(i) => {
                         self.draw_tile(ui, i, area);
                         rects.push((i, area));
@@ -778,9 +792,9 @@ impl eframe::App for App {
                         .then(|| i.pointer.latest_pos())
                         .flatten()
                 });
-                if let (Some(pos), None) = (dbl, &self.replay) {
+                if let Some(pos) = dbl {
                     if let Some(&(i, _)) = rects.iter().find(|(_, r)| r.contains(pos)) {
-                        self.focus = if self.focus == Some(i) { None } else { Some(i) };
+                        self.set_focus(if self.focus == Some(i) { None } else { Some(i) });
                     }
                 }
                 self.tile_rects = rects;

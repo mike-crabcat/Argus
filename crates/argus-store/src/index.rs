@@ -97,6 +97,18 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("init_segment", "remote", "TEXT"),
 ];
 
+/// A chunk replay can read, with where its bytes are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayChunk {
+    pub chunk: ChunkRecord,
+    pub init_key: String,
+    /// The file is (still) on local disk.
+    pub local: bool,
+    /// Its key in object storage, if uploaded.
+    pub remote: Option<String>,
+    pub init_remote: Option<String>,
+}
+
 /// A closed chunk, as the uploader and eviction see it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredChunk {
@@ -442,6 +454,67 @@ impl Index {
                 "SELECT rfc6381, width, height FROM init_segment WHERE object_key = ?1",
                 [object_key],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Chunks ending after `from_ms` that can be played: on local disk, or
+    /// only in object storage (with their remote keys). Oldest first.
+    pub fn replay_chunks_from(
+        &self,
+        camera: &str,
+        stream: &str,
+        from_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ReplayChunk>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT c.camera, c.stream, c.start_ms, c.end_ms, c.object_key, c.bytes, c.init_id,
+                    c.gop_index, i.object_key, c.tier, c.remote, i.remote
+               FROM chunk c JOIN init_segment i ON i.id = c.init_id
+              WHERE c.camera = ?1 AND c.stream = ?2 AND c.end_ms > ?3
+                AND (c.tier = 'local' OR (c.tier = 'remote' AND c.remote IS NOT NULL))
+              ORDER BY c.start_ms LIMIT ?4",
+        )?;
+        let rows = st.query_map(
+            params![
+                camera,
+                stream,
+                from_ms,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |r| {
+                Ok(ReplayChunk {
+                    chunk: ChunkRecord {
+                        camera: r.get(0)?,
+                        stream: r.get(1)?,
+                        start_ms: r.get(2)?,
+                        end_ms: r.get(3)?,
+                        object_key: r.get(4)?,
+                        bytes: r.get::<_, i64>(5)? as u64,
+                        init_id: r.get(6)?,
+                        gops: gop_index::decode(&r.get::<_, Vec<u8>>(7)?),
+                    },
+                    init_key: r.get(8)?,
+                    local: r.get::<_, String>(9)? == tier::LOCAL,
+                    remote: r.get(10)?,
+                    init_remote: r.get(11)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The object-storage key of a chunk or init segment, if uploaded.
+    pub fn remote_key_of(&self, object_key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT remote FROM chunk WHERE object_key = ?1 AND remote IS NOT NULL
+                 UNION ALL
+                 SELECT remote FROM init_segment WHERE object_key = ?1 AND remote IS NOT NULL
+                 LIMIT 1",
+                [object_key],
+                |r| r.get(0),
             )
             .optional()?)
     }

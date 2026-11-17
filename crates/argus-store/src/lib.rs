@@ -15,6 +15,6 @@ pub mod upload;
 pub mod writer;
 
 pub use gop_index::GopEntry;
-pub use index::{ChunkRecord, Index, SeekTarget, StoredChunk};
+pub use index::{ChunkRecord, Index, ReplayChunk, SeekTarget, StoredChunk};
 pub use upload::{Policy, StreamPolicy, Uploader};
 pub use writer::ChunkWriter;
