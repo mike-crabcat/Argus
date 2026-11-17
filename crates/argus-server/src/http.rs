@@ -11,12 +11,17 @@
 //! * `GET /api/media/{key}`: an init segment or chunk file, with `Range`.
 //! * `GET /api/replay?t=MS&stream=sub&cameras=a,b`: WebSocket, synced replay
 //!   of several cameras (see [`crate::replay`]).
+//! * `GET /api/info`: who the caller is (`admin` or `device`) and the
+//!   configured `public_url`, for the viewer.
+//! * `GET /api/devices`, `POST /api/devices` (`{"name": ...}`),
+//!   `DELETE /api/devices/{id}`: phones added by QR code (main token only).
 //! * Anything else: static files from `[http] web_root` (the browser app),
 //!   if configured. These need no token; the API does.
 //!
 //! Auth: with a token configured, every API request needs
 //! `Authorization: Bearer <token>`, or `?token=<token>` (browsers can't set
-//! headers on WebSockets).
+//! headers on WebSockets). The main token is the admin; a device token
+//! (see [`crate::devices`]) can view everything but not manage devices.
 //!
 //! Each viewer has a bounded queue. If it fills (slow network, background
 //! tab), frames are dropped until the next keyframe, so the viewer resumes
@@ -57,6 +62,41 @@ pub struct AppState {
     pub web_root: Option<Arc<PathBuf>>,
     /// Recordings, for replay. None disables the replay routes.
     pub recordings: Option<Recordings>,
+    /// Per-device tokens. None: only the main token works.
+    pub devices: Option<Arc<crate::devices::Devices>>,
+    /// The address phones reach this server at (`[http] public_url`).
+    pub public_url: Option<Arc<str>>,
+}
+
+/// Who made a request, set by the auth middleware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The main token (or no token configured).
+    Admin,
+    /// A device token: viewing only.
+    Device,
+}
+
+/// The device a request came from (device tokens only).
+#[derive(Clone, Debug)]
+pub struct DeviceId(pub String);
+
+/// Resolves when the caller's device is revoked; never for the main token.
+/// WebSocket handlers race their session against it.
+pub fn until_revoked(
+    st: &AppState,
+    device: Option<axum::Extension<DeviceId>>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let watch = device.and_then(|d| st.devices.clone().map(|s| (s, d.0.0)));
+    async move {
+        match watch {
+            Some((devices, id)) => {
+                devices.revoked(&id).await;
+                info!(%id, "closing a revoked device's stream");
+            }
+            None => std::future::pending().await,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -84,6 +124,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/seek", get(crate::replay::http::seek))
         .route("/api/media/{*key}", get(crate::replay::http::media))
         .route("/api/replay", get(crate::replay::http::replay_ws))
+        .route("/api/info", get(info))
+        .route("/api/devices", get(list_devices).post(create_device))
+        .route("/api/devices/{id}", axum::routing::delete(revoke_device))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     api.route("/healthz", get(healthz))
         .fallback(static_file)
@@ -147,22 +190,128 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::i
 async fn auth(
     State(st): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    let Some(token) = &st.token else {
-        return next.run(req).await;
+    let role = match &st.token {
+        None => Some(Role::Admin),
+        Some(token) => {
+            let bearer = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match bearer.or(q.get("token").map(String::as_str)) {
+                Some(g) if constant_time_eq(g.as_bytes(), token.as_bytes()) => Some(Role::Admin),
+                Some(g) => match st.devices.as_ref().and_then(|d| d.verify(g, now_ms())) {
+                    Some(id) => {
+                        req.extensions_mut().insert(DeviceId(id));
+                        Some(Role::Device)
+                    }
+                    None => None,
+                },
+                None => None,
+            }
+        }
     };
-    let bearer = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let given = bearer.or(q.get("token").map(String::as_str));
-    if given.is_some_and(|g| constant_time_eq(g.as_bytes(), token.as_bytes())) {
-        next.run(req).await
-    } else {
-        (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response()
+    match role {
+        Some(role) => {
+            req.extensions_mut().insert(role);
+            next.run(req).await
+        }
+        None => (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response(),
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// The caller's role and the server's public address.
+async fn info(
+    State(st): State<AppState>,
+    axum::Extension(role): axum::Extension<Role>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "role": match role { Role::Admin => "admin", Role::Device => "device" },
+        "public_url": st.public_url.as_deref(),
+        "version": VERSION,
+    }))
+}
+
+/// The device store, for an admin; otherwise the error response.
+fn devices_for(
+    st: &AppState,
+    role: Role,
+) -> Result<&Arc<crate::devices::Devices>, (StatusCode, &'static str)> {
+    if role != Role::Admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "only the main token can manage devices",
+        ));
+    }
+    st.devices
+        .as_ref()
+        .ok_or((StatusCode::NOT_FOUND, "devices are not enabled"))
+}
+
+async fn list_devices(
+    State(st): State<AppState>,
+    axum::Extension(role): axum::Extension<Role>,
+) -> Response {
+    match devices_for(&st, role) {
+        Ok(d) => Json(json!({ "devices": d.list() })).into_response(),
+        Err(r) => r.into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct NewDevice {
+    name: String,
+}
+
+/// Adds a device. The response is the only place its token appears.
+async fn create_device(
+    State(st): State<AppState>,
+    axum::Extension(role): axum::Extension<Role>,
+    Json(body): Json<NewDevice>,
+) -> Response {
+    let d = match devices_for(&st, role) {
+        Ok(d) => d,
+        Err(r) => return r.into_response(),
+    };
+    match d.create(&body.name, now_ms()) {
+        Ok((device, token)) => {
+            info!(id = %device.id, name = %device.name, "device added");
+            (
+                StatusCode::CREATED,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(json!({ "device": device, "token": token })),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn revoke_device(
+    State(st): State<AppState>,
+    axum::Extension(role): axum::Extension<Role>,
+    Path(id): Path<String>,
+) -> Response {
+    let d = match devices_for(&st, role) {
+        Ok(d) => d,
+        Err(r) => return r.into_response(),
+    };
+    match d.revoke(&id) {
+        Ok(true) => {
+            info!(%id, "device revoked");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -198,12 +347,19 @@ async fn cameras(State(st): State<AppState>) -> Json<serde_json::Value> {
 async fn live_ws(
     State(st): State<AppState>,
     Path((camera, stream)): Path<(String, String)>,
+    device: Option<axum::Extension<DeviceId>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let Some(s) = st.live.get(&camera, &stream) else {
         return (StatusCode::NOT_FOUND, "no such camera stream").into_response();
     };
-    ws.on_upgrade(move |socket| viewer(socket, s))
+    let revoked = until_revoked(&st, device);
+    ws.on_upgrade(move |socket| async move {
+        tokio::select! {
+            _ = viewer(socket, s) => {}
+            _ = revoked => {}
+        }
+    })
 }
 
 enum Out {

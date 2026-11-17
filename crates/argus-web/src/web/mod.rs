@@ -1,6 +1,7 @@
 //! Browser entry point and small web helpers.
 
 mod app;
+mod phones;
 mod replay;
 mod theme;
 mod tile;
@@ -132,13 +133,30 @@ fn urlencode(s: &str) -> String {
 
 /// GET a JSON API path with the bearer token; returns the body text.
 pub(crate) async fn get_text(path: &str, token: Option<&str>) -> Result<String, String> {
+    request("GET", path, None, token).await
+}
+
+/// An API request with an optional JSON body; returns the body text.
+pub(crate) async fn request(
+    method: &str,
+    path: &str,
+    json: Option<&str>,
+    token: Option<&str>,
+) -> Result<String, String> {
     let window = web_sys::window().unwrap();
     let init = RequestInit::new();
+    init.set_method(method);
     let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
     if let Some(t) = token {
         headers
             .set("Authorization", &format!("Bearer {t}"))
             .map_err(|e| format!("{e:?}"))?;
+    }
+    if let Some(body) = json {
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(|e| format!("{e:?}"))?;
+        init.set_body(&wasm_bindgen::JsValue::from_str(body));
     }
     init.set_headers(&headers);
     let resp: Response = JsFuture::from(window.fetch_with_str_and_init(path, &init))
@@ -149,11 +167,25 @@ pub(crate) async fn get_text(path: &str, token: Option<&str>) -> Result<String, 
     if resp.status() == 401 {
         return Err(UNAUTHORIZED.into());
     }
-    if !resp.ok() {
-        return Err(format!("{path}: HTTP {}", resp.status()));
-    }
     let text = JsFuture::from(resp.text().map_err(|e| format!("{e:?}"))?)
         .await
-        .map_err(|e| format!("{e:?}"))?;
-    text.as_string().ok_or_else(|| "empty response".into())
+        .map_err(|e| format!("{e:?}"))?
+        .as_string()
+        .unwrap_or_default();
+    if !resp.ok() {
+        let detail = text.trim();
+        return Err(if detail.is_empty() || detail.len() > 200 {
+            format!("HTTP {}", resp.status())
+        } else {
+            detail.to_owned()
+        });
+    }
+    Ok(text)
+}
+
+/// The page's origin, e.g. `http://127.0.0.1:8080`.
+pub(crate) fn origin() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_default()
 }

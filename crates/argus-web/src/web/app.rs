@@ -10,6 +10,7 @@ use eframe::egui::{
 };
 use eframe::egui_wgpu::RenderState;
 
+use super::phones::Phones;
 use super::replay::Replay;
 use super::theme::{self, ACCENT, ALERT, BG, LINE, SURFACE, TEXT, TEXT_2, TEXT_3};
 use super::tile::{Status, Tile};
@@ -69,6 +70,10 @@ pub struct App {
     /// The timeline bar's rect and time range, [x, y, w, h, t0, t1], for
     /// scripts that want to click a time.
     timeline_rect_cache: Option<[f64; 6]>,
+    /// Phones added by QR code (admin only).
+    phones: Phones,
+    /// Whether `phones` knows our role for the current sign-in.
+    phones_loaded: bool,
 }
 
 impl App {
@@ -110,6 +115,8 @@ impl App {
             last_stats_ms: 0.0,
             hover_ms: None,
             timeline_rect_cache: None,
+            phones: Phones::default(),
+            phones_loaded: false,
         }
     }
 
@@ -178,6 +185,8 @@ impl App {
         }
         self.tiles.clear();
         self.focus = None;
+        self.phones.forget();
+        self.phones_loaded = false;
         *self.cameras.borrow_mut() = Cameras::NeedToken(None);
     }
 
@@ -264,6 +273,7 @@ impl App {
             let token = self.token_input.trim().to_owned();
             self.token_input.clear();
             self.token = Some(token.clone());
+            self.phones_loaded = false;
             fetch_cameras(&self.cameras, Some(token), ui.ctx());
         }
     }
@@ -385,6 +395,14 @@ impl App {
             "tiles": tiles,
             "replay": replay,
             "timeline": self.timeline_rect_cache,
+            "phones": {
+                "role": self.phones.role(),
+                "open": self.phones.open,
+                "count": self.phones.count(),
+                "qr": self.phones.showing_qr(),
+                "qr_rect": self.phones.qr_rect.map(|r| [r.min.x, r.min.y, r.width(), r.height()]),
+                "buttons": super::phones::buttons(),
+            },
         })
         .to_string();
         if let Some(w) = web_sys::window() {
@@ -410,19 +428,6 @@ impl App {
             "Argus",
             theme::semibold(17.0),
             TEXT,
-        );
-        let what = match &*self.cameras.borrow() {
-            Cameras::Loading => "loading cameras…".to_string(),
-            Cameras::Loaded(_) => format!("{n} cameras"),
-            Cameras::Failed(_) => "no cameras".to_string(),
-            Cameras::NeedToken(_) => "signed out".to_string(),
-        };
-        p.text(
-            pos2(title.right() + 14.0, cy),
-            Align2::LEFT_CENTER,
-            what,
-            theme::regular(13.5),
-            TEXT_2,
         );
 
         // Right side, right to left: Live | Replay switch, Stats, backend.
@@ -507,13 +512,45 @@ impl App {
             theme::regular(12.5),
             if self.show_stats { TEXT } else { TEXT_2 },
         );
-        let backend = p.text(
-            pos2(stats_r.left() - 12.0, cy),
-            Align2::RIGHT_CENTER,
-            &self.backend,
-            theme::mono(11.0),
-            TEXT_3,
-        );
+        // Phones (admin only): add a phone by QR code, or revoke one.
+        let mut left = stats_r.left();
+        if self.phones.is_admin() && matches!(*self.cameras.borrow(), Cameras::Loaded(_)) {
+            let phones_r = pill(left - 8.0, 72.0);
+            let resp = ui.interact(phones_r, id.with("phones"), Sense::click());
+            if resp.clicked() {
+                self.phones.show(self.token.clone(), ui.ctx());
+            }
+            p.rect_filled(phones_r, CornerRadius::same(theme::PILL_RADIUS), SURFACE);
+            p.rect_stroke(
+                phones_r,
+                CornerRadius::same(theme::PILL_RADIUS),
+                Stroke::new(1.0, if resp.hovered() { ACCENT } else { LINE }),
+                StrokeKind::Inside,
+            );
+            p.text(
+                phones_r.center(),
+                Align2::CENTER_CENTER,
+                "Phones",
+                theme::regular(12.5),
+                if resp.hovered() { TEXT } else { TEXT_2 },
+            );
+            left = phones_r.left();
+        }
+        // On narrow screens (phones) the less useful labels give way.
+        let min_x = title.right() + 12.0;
+        let g = p.layout_no_wrap(self.backend.clone(), theme::mono(11.0), TEXT_3);
+        let backend = if left - 12.0 - g.size().x > min_x + 120.0 {
+            p.text(
+                pos2(left - 12.0, cy),
+                Align2::RIGHT_CENTER,
+                &self.backend,
+                theme::mono(11.0),
+                TEXT_3,
+            )
+        } else {
+            Rect::from_min_max(pos2(left - 4.0, cy), pos2(left - 4.0, cy))
+        };
+        let mut left_used = backend.left();
         // Sign out: forget the token in this browser.
         if self.token.is_some() && matches!(*self.cameras.borrow(), Cameras::Loaded(_)) {
             let g = p.layout_no_wrap("Sign out".into(), theme::regular(12.5), TEXT_2);
@@ -521,12 +558,27 @@ impl App {
                 pos2(backend.left() - 16.0 - g.size().x, cy - g.size().y / 2.0),
                 g.size(),
             );
+            if r.left() < min_x {
+                return;
+            }
             let resp = ui.interact(r.expand(4.0), id.with("signout"), Sense::click());
             let color = if resp.hovered() { TEXT } else { TEXT_2 };
             p.galley(r.min, g, color);
             if resp.clicked() {
                 self.sign_out(rs);
             }
+            left_used = r.left();
+        }
+        // The camera count, if there's room left.
+        let what = match &*self.cameras.borrow() {
+            Cameras::Loading => "loading cameras…".to_string(),
+            Cameras::Loaded(_) => format!("{n} cameras"),
+            Cameras::Failed(_) => "no cameras".to_string(),
+            Cameras::NeedToken(_) => "signed out".to_string(),
+        };
+        let g = p.layout_no_wrap(what, theme::regular(13.5), TEXT_2);
+        if title.right() + 14.0 + g.size().x + 12.0 < left_used {
+            p.galley(pos2(title.right() + 14.0, cy - g.size().y / 2.0), g, TEXT_2);
         }
     }
 
@@ -627,6 +679,9 @@ impl App {
             let size = g.size() + vec2(12.0, 6.0);
             let r =
                 Rect::from_min_size(pos2(right - size.x, rect.top() + 16.0 - size.y / 2.0), size);
+            if r.left() < chip.right() + 6.0 {
+                return; // a narrow tile: the name matters more
+            }
             p.rect_filled(
                 r,
                 CornerRadius::same(theme::PILL_RADIUS),
@@ -877,6 +932,10 @@ impl eframe::App for App {
             self.set_focus(None);
         }
         self.publish_stats();
+        if !self.phones_loaded && matches!(*self.cameras.borrow(), Cameras::Loaded(_)) {
+            self.phones_loaded = true;
+            self.phones.load(self.token.clone(), ctx);
+        }
 
         egui::Panel::top("bar")
             .exact_size(44.0)
@@ -962,6 +1021,8 @@ impl eframe::App for App {
                 }
                 self.tile_rects = rects;
             });
+        self.phones
+            .ui(ctx, self.token.clone(), now_us() as f64 / 1000.0);
         // Keep the stats readout fresh even without new frames.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }

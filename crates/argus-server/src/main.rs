@@ -189,6 +189,20 @@ async fn run(cfg: Config) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(h.listen)
             .await
             .with_context(|| format!("listening on {}", h.listen))?;
+        let devices = Arc::new(argus_server::devices::Devices::open(&cfg.storage.root)?);
+        {
+            // Last-used times are kept in memory; write them out now and then.
+            let devices = devices.clone();
+            background.push(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(300));
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = devices.flush() {
+                        warn!("saving devices: {e:#}");
+                    }
+                }
+            }));
+        }
         let state = http::AppState {
             live: live.clone(),
             token: h.token.as_deref().map(Arc::from),
@@ -201,6 +215,11 @@ async fn run(cfg: Config) -> Result<()> {
                     None => None,
                 },
             }),
+            devices: Some(devices),
+            public_url: h
+                .public_url
+                .as_deref()
+                .map(|u| Arc::from(u.trim_end_matches('/'))),
         };
         info!(listen = %h.listen, auth = h.token.is_some(), version = http::VERSION,
           "HTTP API and live view");

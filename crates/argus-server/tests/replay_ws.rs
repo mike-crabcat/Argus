@@ -79,6 +79,8 @@ async fn server_with(
             root: Arc::new(dir.path().to_owned()),
             remote,
         }),
+        devices: None,
+        public_url: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();

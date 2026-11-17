@@ -20,6 +20,11 @@ listen = "127.0.0.1:8080"
 #                                  # open the app as https://host/?token=...
 # The browser app, built with scripts/build-web.sh:
 # web_root = "web/dist"
+# The address phones reach Argus at. Phones are added from the viewer
+# (Phones, then Add phone) with a QR code that points here and carries the
+# phone's own token; revoke a phone there too. Without it the QR code uses
+# the address the viewer is open at.
+# public_url = "https://host.your-tailnet.ts.net:8444"
 
 # Optional: copy recordings to S3 or any S3-compatible store (MinIO,
 # Backblaze B2, Wasabi...). Without this section everything stays local.

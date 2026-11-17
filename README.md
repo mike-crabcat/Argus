@@ -58,6 +58,18 @@ Set `web_root = "web/dist"` under `[http]` and open `http://127.0.0.1:8080/`
 (add `?token=...` if you set one). Browsers only decode video in a secure
 context, so from other machines use HTTPS, e.g. `tailscale serve`.
 
+### Phones
+
+Signed in with the main token, click **Phones** in the top bar, name the
+phone and click **Add phone**. Scan the QR code with the phone's camera: it
+opens Argus signed in with a token of the phone's own, which the phone
+remembers. Set `public_url` under `[http]` to the address phones reach
+Argus at (e.g. your `tailscale serve` URL); otherwise the QR code uses the
+address the viewer is open at. **Revoke** signs a phone out at once, including
+any streams it has open. Device tokens can watch live and replay but can't
+add or revoke phones; they are stored hashed in `devices.json` in the
+storage root.
+
 ### Replay
 
 Click **Replay** in the viewer's top bar: all cameras play back together
