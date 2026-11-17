@@ -2,6 +2,7 @@ pub mod config;
 pub mod devices;
 pub mod http;
 pub mod live;
+pub mod plan;
 pub mod recorder;
 pub mod reolink;
 pub mod replay;
