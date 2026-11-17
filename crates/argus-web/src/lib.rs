@@ -10,6 +10,7 @@
 //! statistics helpers below are plain Rust and tested natively.
 
 pub mod layout;
+pub mod plandoc;
 pub mod stats;
 
 #[cfg(target_arch = "wasm32")]

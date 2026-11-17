@@ -227,6 +227,7 @@ dependencies = [
 name = "argus-web"
 version = "0.1.0"
 dependencies = [
+ "argus-plan",
  "argus-proto",
  "eframe",
  "js-sys",

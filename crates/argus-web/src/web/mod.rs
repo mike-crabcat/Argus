@@ -2,6 +2,7 @@
 
 mod app;
 mod phones;
+mod plan;
 mod replay;
 mod theme;
 mod tile;
@@ -181,6 +182,150 @@ pub(crate) async fn request(
         });
     }
     Ok(text)
+}
+
+/// A request with any body; returns (status, body text). Only network
+/// failures are errors.
+pub(crate) async fn send(
+    method: &str,
+    path: &str,
+    body: Option<&wasm_bindgen::JsValue>,
+    content_type: Option<&str>,
+    token: Option<&str>,
+) -> Result<(u16, String), String> {
+    let window = web_sys::window().unwrap();
+    let init = RequestInit::new();
+    init.set_method(method);
+    let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
+    if let Some(t) = token {
+        headers
+            .set("Authorization", &format!("Bearer {t}"))
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    if let Some(ct) = content_type {
+        headers
+            .set("Content-Type", ct)
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    if let Some(b) = body {
+        init.set_body(b);
+    }
+    init.set_headers(&headers);
+    let resp: Response = JsFuture::from(window.fetch_with_str_and_init(path, &init))
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .dyn_into()
+        .map_err(|_| "not a Response".to_string())?;
+    let text = JsFuture::from(resp.text().map_err(|e| format!("{e:?}"))?)
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .as_string()
+        .unwrap_or_default();
+    Ok((resp.status(), text))
+}
+
+/// Downloads an image with the token and decodes it in the browser to
+/// RGBA, scaled down to at most `max` pixels a side. Returns the decoded
+/// size, the original size and the pixels.
+pub(crate) async fn fetch_image(
+    path: &str,
+    token: Option<&str>,
+    max: u32,
+) -> Result<([usize; 2], [u32; 2], Vec<u8>), String> {
+    let window = web_sys::window().unwrap();
+    let init = RequestInit::new();
+    let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
+    if let Some(t) = token {
+        headers
+            .set("Authorization", &format!("Bearer {t}"))
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    init.set_headers(&headers);
+    let resp: Response = JsFuture::from(window.fetch_with_str_and_init(path, &init))
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .dyn_into()
+        .map_err(|_| "not a Response".to_string())?;
+    if !resp.ok() {
+        return Err(format!("image: HTTP {}", resp.status()));
+    }
+    let blob: web_sys::Blob = JsFuture::from(resp.blob().map_err(|e| format!("{e:?}"))?)
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .dyn_into()
+        .map_err(|_| "not a Blob".to_string())?;
+    let bmp: web_sys::ImageBitmap = JsFuture::from(
+        window
+            .create_image_bitmap_with_blob(&blob)
+            .map_err(|e| format!("{e:?}"))?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?
+    .dyn_into()
+    .map_err(|_| "not an ImageBitmap".to_string())?;
+    let (ow, oh) = (bmp.width(), bmp.height());
+    let k = (max as f64 / ow.max(oh) as f64).min(1.0);
+    let (w, h) = (
+        ((ow as f64 * k).round() as u32).max(1),
+        ((oh as f64 * k).round() as u32).max(1),
+    );
+    let canvas: web_sys::HtmlCanvasElement = window
+        .document()
+        .unwrap()
+        .create_element("canvas")
+        .map_err(|e| format!("{e:?}"))?
+        .dyn_into()
+        .map_err(|_| "not a canvas".to_string())?;
+    canvas.set_width(w);
+    canvas.set_height(h);
+    // A CPU-backed canvas: reading back a GPU one can give blank pixels.
+    let opts = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&opts, &"willReadFrequently".into(), &true.into());
+    let cx: web_sys::CanvasRenderingContext2d = canvas
+        .get_context_with_context_options("2d", &opts)
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("no 2d context")?
+        .dyn_into()
+        .map_err(|_| "not a 2d context".to_string())?;
+    cx.draw_image_with_image_bitmap_and_dw_and_dh(&bmp, 0.0, 0.0, w as f64, h as f64)
+        .map_err(|e| format!("{e:?}"))?;
+    let data = cx
+        .get_image_data(0, 0, w as i32, h as i32)
+        .map_err(|e| format!("{e:?}"))?;
+    bmp.close();
+    Ok(([w as usize, h as usize], [ow, oh], data.data().0))
+}
+
+/// Opens the browser's file picker for an image; `on_file` gets the file.
+/// The input stays in the page (id `argus-file`) so scripts can fill it.
+pub(crate) fn pick_image(on_file: impl Fn(web_sys::File) + 'static) {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let input: web_sys::HtmlInputElement = match document.get_element_by_id("argus-file") {
+        Some(el) => el.dyn_into().unwrap(),
+        None => {
+            let el: web_sys::HtmlInputElement = document
+                .create_element("input")
+                .unwrap()
+                .dyn_into()
+                .unwrap();
+            el.set_type("file");
+            el.set_id("argus-file");
+            el.set_accept("image/png,image/jpeg");
+            let _ = el.style().set_property("display", "none");
+            let _ = document.body().unwrap().append_child(&el);
+            el
+        }
+    };
+    let target = input.clone();
+    let cb = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+        if let Some(f) = target.files().and_then(|l| l.get(0)) {
+            on_file(f);
+        }
+        target.set_value("");
+    });
+    input.set_onchange(Some(cb.as_ref().unchecked_ref()));
+    cb.forget();
+    input.click();
 }
 
 /// The page's origin, e.g. `http://127.0.0.1:8080`.
