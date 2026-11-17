@@ -40,6 +40,9 @@ pub struct ChunkWriter {
     /// Where the next audio fragment starts on the audio track, so audio
     /// stays contiguous across fragments despite arrival jitter.
     next_audio_dts: Option<u64>,
+    /// Where the next video fragment starts (90 kHz), so fragments never
+    /// overlap when the wall clock is pulled earlier between GOPs.
+    next_video_dts: Option<u64>,
     open: Option<OpenChunk>,
     sequence: u32,
 }
@@ -79,6 +82,7 @@ impl ChunkWriter {
             gop: Vec::new(),
             audio: VecDeque::new(),
             next_audio_dts: None,
+            next_video_dts: None,
             open: None,
             sequence: 1,
         }
@@ -139,6 +143,7 @@ impl ChunkWriter {
         self.flush(None)?;
         self.audio.clear();
         self.next_audio_dts = None;
+        self.next_video_dts = None;
         self.close_chunk()
     }
 
@@ -159,7 +164,20 @@ impl ChunkWriter {
             None => self.audio.len(),
         };
         let audio: Vec<AudioFrame> = self.audio.drain(..audio_end).collect();
-        let gop_start_ms = gop[0].wall_ms();
+        let durations = fmp4::durations(&gop, next.map(|(pts, _)| pts));
+        let total: u64 = durations.iter().map(|&d| u64::from(d)).sum();
+        // Decode time is wall-clock time in 90 kHz ticks since the Unix epoch,
+        // so every camera's fragments share one timeline and chunks can be
+        // concatenated or fed to a player back to back. If the wall clock
+        // was corrected earlier since the last GOP (by up to a second),
+        // continue where that one ended instead of overlapping it.
+        let from_wall = u64::try_from(gop[0].wall_us).unwrap_or(0) * 9 / 100;
+        let base = match self.next_video_dts {
+            Some(n) if from_wall < n && n - from_wall <= 90_000 => n,
+            _ => from_wall,
+        };
+        self.next_video_dts = Some(base + total);
+        let gop_start_ms = (base / 90) as i64;
         if self.open.as_ref().is_some_and(|c| {
             gop_start_ms - c.start_ms >= self.chunk_ms || gop_start_ms < c.start_ms
         }) {
@@ -169,11 +187,6 @@ impl ChunkWriter {
             self.open = Some(self.open_chunk(gop_start_ms)?);
         }
         let c = self.open.as_mut().unwrap();
-        let durations = fmp4::durations(&gop, next.map(|(pts, _)| pts));
-        // Decode time is wall-clock time in 90 kHz ticks since the Unix epoch,
-        // so every camera's fragments share one timeline and chunks can be
-        // concatenated or fed to a player back to back.
-        let base = u64::try_from(gop[0].wall_us).unwrap_or(0) * 9 / 100;
         let audio_run = match (&self.audio_config, audio.first()) {
             (Some(cfg), Some(first)) => {
                 // The audio track's decode time is wall-clock time in samples
@@ -201,7 +214,6 @@ impl ChunkWriter {
             fmp4::fragment_with_audio(self.sequence, base, &gop, &durations, audio_run.as_ref());
         self.sequence = self.sequence.wrapping_add(1);
         c.file.write_all(&frag)?;
-        let total: u64 = durations.iter().map(|&d| u64::from(d)).sum();
         c.gops.push(GopEntry {
             start_offset_ms: (gop_start_ms - c.start_ms) as u32,
             byte_offset: c.bytes as u32,
@@ -365,6 +377,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(t.gop_start_ms, chunks[1].start_ms + 1000);
+    }
+
+    /// tfdt of each fragment in a chunk file, in order.
+    fn tfdts(bytes: &[u8]) -> Vec<u64> {
+        bytes
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == b"tfdt")
+            .map(|(i, _)| u64::from_be_bytes(bytes[i + 8..i + 16].try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn earlier_clock_correction_does_not_overlap_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(Mutex::new(Index::open_in_memory().unwrap()));
+        let mut w = ChunkWriter::new(dir.path(), "cam", "sub", 60, index.clone());
+        let cfg = VideoConfig::from_avcc(&[1, 0x4d, 0, 0x1f, 0xff, 0xe0, 0], 640, 360).unwrap();
+        w.on_config(&cfg).unwrap();
+        for i in 0..30 {
+            let mut f = frame(i, i % 10 == 0);
+            if i >= 10 {
+                // The wall clock was pulled 30 ms earlier after the first GOP.
+                f.wall_us -= 30_000;
+            }
+            w.on_frame(f).unwrap();
+        }
+        w.finish().unwrap();
+        let chunk = index
+            .lock()
+            .unwrap()
+            .chunks_between("cam", "sub", 0, i64::MAX)
+            .unwrap()
+            .remove(0);
+        let t = tfdts(&std::fs::read(dir.path().join(&chunk.object_key)).unwrap());
+        // 1 s GOPs at 90 kHz, back to back: the second GOP starts where the
+        // first ended, not 30 ms inside it.
+        assert_eq!(t.len(), 3);
+        assert_eq!(t[1] - t[0], 90_000);
+        assert_eq!(t[2] - t[1], 90_000);
+        let starts: Vec<_> = chunk.gops.iter().map(|g| g.start_offset_ms).collect();
+        assert_eq!(starts, [0, 1000, 2000]);
     }
 
     fn audio(i: i64) -> AudioFrame {
