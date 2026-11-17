@@ -20,7 +20,34 @@ use eframe::egui::{
 
 use super::theme::{self, ACCENT, ALERT, BG, LINE, SURFACE, TEXT, TEXT_2, TEXT_3};
 use super::{fetch_image, now_ms, pick_image, send};
-use crate::plandoc::{self, Doc, View, fmt_len};
+use crate::plandoc::{self, Doc, EventList, MapEvent, View, fmt_len};
+
+/// What a tap on the map asks the app to do.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MapAction {
+    /// Show this camera live, full window.
+    Live(String),
+    /// Replay from this time (ms), with this camera full window.
+    Replay { camera: String, t_ms: f64 },
+}
+
+/// How far back the map shows events.
+const WINDOWS: [(&str, f64); 3] = [
+    ("15 min", 900_000.0),
+    ("1 h", 3_600_000.0),
+    ("6 h", 21_600_000.0),
+];
+const EVENTS_EVERY_MS: f64 = 15_000.0;
+
+/// Marker colour per event label.
+fn label_color(label: &str) -> Color32 {
+    match label {
+        "person" => ALERT,
+        "vehicle" => Color32::from_rgb(0xF2, 0xB8, 0x5B),
+        "animal" => Color32::from_rgb(0x7F, 0xD1, 0x8B),
+        _ => TEXT_2,
+    }
+}
 
 thread_local! {
     /// Toolbar buttons drawn this frame, (label, [x, y, w, h]), for scripts.
@@ -49,6 +76,7 @@ enum Msg {
         h: u32,
     },
     Failed(String),
+    Events(Vec<MapEvent>),
     Image {
         id: String,
         size: [usize; 2],
@@ -150,6 +178,12 @@ pub struct PlanView {
     scale_to: Option<Point>,
     canvas: Rect,
     hover_world: Option<Point>,
+    events: Vec<MapEvent>,
+    events_ms: f64,
+    window: usize,
+    /// Event markers drawn last frame: (screen position, index in events).
+    markers: Vec<(Pos2, usize)>,
+    action: Option<MapAction>,
 }
 
 fn sp(v: &View, p: Point) -> Pos2 {
@@ -193,6 +227,11 @@ impl PlanView {
             scale_to: None,
             canvas: Rect::NOTHING,
             hover_world: None,
+            events: Vec::new(),
+            events_ms: f64::NEG_INFINITY,
+            window: 1,
+            markers: Vec::new(),
+            action: None,
         };
         v.load(ctx);
         v
@@ -211,6 +250,24 @@ impl PlanView {
             };
             inbox.borrow_mut().push(msg);
             ctx.request_repaint();
+        });
+    }
+
+    fn fetch_events(&mut self, ctx: &egui::Context) {
+        if now_ms() - self.events_ms < EVENTS_EVERY_MS {
+            return;
+        }
+        self.events_ms = now_ms();
+        let from = super::now_us() / 1000 - WINDOWS[self.window].1 as i64;
+        let path = format!("/api/events?from={from}");
+        let (inbox, token, ctx) = (self.inbox.clone(), self.token.clone(), ctx.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok((200, body)) = send("GET", &path, None, None, token.as_deref()).await
+                && let Ok(list) = serde_json::from_str::<EventList>(&body)
+            {
+                inbox.borrow_mut().push(Msg::Events(list.events));
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -254,6 +311,7 @@ impl PlanView {
                 }
                 Msg::Uploaded { id, w, h } => self.place_background(id, w, h),
                 Msg::Failed(e) => self.note(e),
+                Msg::Events(e) => self.events = e,
                 Msg::Image {
                     id,
                     size,
@@ -449,13 +507,29 @@ impl PlanView {
             "typed": self.typed,
             "images": { "loaded": self.bgs.len(), "loading": self.bg_loading.len() },
             "buttons": BUTTONS.with(|b| b.borrow().clone()),
+            "events": self.events.len(),
+            "markers": self.markers.iter().map(|(p, i)| serde_json::json!({
+                "x": p.x, "y": p.y, "camera": self.events[*i].camera, "label": self.events[*i].label,
+                "start_ms": self.events[*i].start_ms,
+            })).collect::<Vec<_>>(),
+            "cameras_on_screen": self.level().zip(self.view).map(|(l, v)| l.cameras.iter().map(|c| {
+                let p = sp(&v, c.at);
+                serde_json::json!({ "camera": c.camera, "x": p.x, "y": p.y })
+            }).collect::<Vec<_>>()),
+            "window": WINDOWS[self.window].0,
             "headings": l.map(|l| l.cameras.iter().map(|c| (c.camera.clone(), c.heading)).collect::<std::collections::BTreeMap<_, _>>()),
         })
     }
 
     /// Draws the plan in `rect`. `cameras` are the configured camera names;
     /// `admin` says whether editing is allowed.
-    pub fn ui(&mut self, ui: &mut egui::Ui, rect: Rect, cameras: &[String], admin: bool) {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        cameras: &[String],
+        admin: bool,
+    ) -> Option<MapAction> {
         let ctx = ui.ctx().clone();
         BUTTONS.with(|b| b.borrow_mut().clear());
         self.poll(&ctx);
@@ -500,7 +574,10 @@ impl PlanView {
                 theme::regular(13.5),
                 TEXT_2,
             );
-            return;
+            return None;
+        }
+        if !self.editing {
+            self.fetch_events(&ctx);
         }
         if self.view.is_none() {
             self.fit();
@@ -530,6 +607,7 @@ impl PlanView {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
+        self.action.take()
     }
 
     fn set_editing(&mut self, on: bool) {
@@ -552,7 +630,7 @@ impl PlanView {
             .level()
             .and_then(|l| plandoc::bounds(l, false))
             .unwrap_or((pt(-2000.0, -2000.0), pt(18000.0, 13000.0)));
-        let margin = (r.width().min(r.height()) * 0.08).max(40.0);
+        let margin = (r.width().min(r.height()) * 0.08).max(if self.editing { 40.0 } else { 90.0 });
         self.view = Some(View::fit(
             lo,
             hi,
@@ -601,6 +679,28 @@ impl PlanView {
             }
         }
         x += 12.0;
+        if !self.editing {
+            p.vline(x, (cy - 10.0)..=(cy + 10.0), Stroke::new(1.0, LINE));
+            x += 12.0;
+            for (i, (name, _)) in WINDOWS.iter().enumerate() {
+                if pill(
+                    ui,
+                    &p,
+                    &mut x,
+                    cy,
+                    name,
+                    self.window == i,
+                    id.with(("win", i)),
+                )
+                .clicked()
+                    && self.window != i
+                {
+                    self.window = i;
+                    self.events_ms = f64::NEG_INFINITY;
+                    self.events.clear();
+                }
+            }
+        }
         if self.editing {
             p.vline(x, (cy - 10.0)..=(cy + 10.0), Stroke::new(1.0, LINE));
             x += 12.0;
@@ -879,6 +979,11 @@ impl PlanView {
             {
                 view.zoom_at((pos.x, pos.y), f);
             }
+            // Two fingers pan (and pinch zooms, above).
+            if let Some(m) = ctx.input(|i| i.multi_touch()) {
+                view.origin.0 += m.translation_delta.x;
+                view.origin.1 += m.translation_delta.y;
+            }
         }
         self.keys(&ctx);
         let pointer = resp.hover_pos().or(resp.interact_pointer_pos());
@@ -952,6 +1057,16 @@ impl PlanView {
             };
             draw_level(&p, &view, l, &self.sel, hover, self.editing);
         }
+        if !self.editing
+            && let Some(l) = &level
+        {
+            self.draw_events(&p, &view, l, canvas, pointer);
+            if resp.clicked()
+                && let Some(at) = resp.interact_pointer_pos()
+            {
+                self.map_tap(&view, l, at);
+            }
+        }
         if let Some(Drag::Box { start }) = &self.drag
             && let Some(cur) = pointer
         {
@@ -971,6 +1086,153 @@ impl PlanView {
                 Tool::Select => egui::CursorIcon::Default,
                 _ => egui::CursorIcon::Crosshair,
             });
+        }
+    }
+
+    /// Event markers around each camera, newest nearest, tinted by label
+    /// and fading with age; a legend; a hint under the pointer.
+    fn draw_events(
+        &mut self,
+        p: &egui::Painter,
+        view: &View,
+        l: &Level,
+        canvas: Rect,
+        pointer: Option<Pos2>,
+    ) {
+        self.markers.clear();
+        let now = super::now_us() as f64 / 1000.0;
+        let window = WINDOWS[self.window].1;
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for c in &l.cameras {
+            let mut idx: Vec<usize> = (0..self.events.len())
+                .filter(|&i| self.events[i].camera == c.camera)
+                .collect();
+            idx.sort_by_key(|&i| std::cmp::Reverse(self.events[i].start_ms));
+            let at = sp(view, c.at);
+            const MAX: usize = 24;
+            for (k, &i) in idx.iter().take(MAX).enumerate() {
+                let e = &self.events[i];
+                let (dx, dy) = plandoc::marker_offset(k, c.heading, c.fov);
+                let m = at + vec2(dx, dy);
+                let a = plandoc::marker_alpha(now, e.start_ms as f64, window);
+                p.circle_filled(m, 5.5, BG);
+                p.circle_filled(m, 4.5, label_color(&e.label).gamma_multiply(a));
+                self.markers.push((m, i));
+            }
+            if idx.len() > MAX {
+                let (dx, dy) = plandoc::marker_offset(MAX, c.heading, c.fov);
+                p.text(
+                    at + vec2(dx, dy),
+                    Align2::CENTER_CENTER,
+                    format!("+{}", idx.len() - MAX),
+                    theme::mono(10.0),
+                    TEXT_2,
+                );
+            }
+            for &i in &idx {
+                let label = &self.events[i].label;
+                match counts.iter_mut().find(|(l, _)| l == label) {
+                    Some(c) => c.1 += 1,
+                    None => counts.push((label.clone(), 1)),
+                }
+            }
+        }
+        // Legend, bottom left.
+        counts.sort();
+        let mut y = canvas.bottom() - 18.0;
+        let x = canvas.left() + 16.0;
+        let total: usize = counts.iter().map(|c| c.1).sum();
+        let head = if total == 0 {
+            format!("No events in the last {}", WINDOWS[self.window].0)
+        } else {
+            format!("{total} events · last {}", WINDOWS[self.window].0)
+        };
+        for (label, n) in counts.iter().rev() {
+            p.circle_filled(pos2(x + 4.0, y), 4.0, label_color(label));
+            p.text(
+                pos2(x + 14.0, y),
+                Align2::LEFT_CENTER,
+                format!("{label} {n}"),
+                theme::regular(12.0),
+                TEXT_2,
+            );
+            y -= 18.0;
+        }
+        p.text(
+            pos2(x, y),
+            Align2::LEFT_CENTER,
+            head,
+            theme::regular(12.0),
+            TEXT_3,
+        );
+        // Hint under the pointer.
+        let Some(ptr) = pointer else { return };
+        let hit = self
+            .markers
+            .iter()
+            .filter(|(m, _)| m.distance(ptr) < 8.0)
+            .min_by(|a, b| a.0.distance(ptr).total_cmp(&b.0.distance(ptr)));
+        let text = if let Some((_, i)) = hit {
+            let e = &self.events[*i];
+            let (hms, _) = local_hms(e.start_ms as f64);
+            Some(format!(
+                "{} · {} · {hms} ({}) · tap to replay",
+                e.label,
+                e.camera,
+                crate::ago(now, e.start_ms as f64)
+            ))
+        } else {
+            l.cameras
+                .iter()
+                .find(|c| sp(view, c.at).distance(ptr) < 14.0)
+                .map(|c| format!("{} · tap for live view", c.camera))
+        };
+        if let Some(t) = text {
+            p.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            let g = p.layout_no_wrap(t, theme::regular(12.0), TEXT);
+            let mut r = Rect::from_min_size(ptr + vec2(14.0, 12.0), g.size() + vec2(16.0, 10.0));
+            if r.right() > canvas.right() - 4.0 {
+                r = r.translate(vec2(-(r.width() + 28.0), 0.0));
+            }
+            p.rect_filled(r, CornerRadius::same(6), SURFACE);
+            p.rect_stroke(
+                r,
+                CornerRadius::same(6),
+                Stroke::new(1.0, LINE),
+                StrokeKind::Inside,
+            );
+            p.galley(r.min + vec2(8.0, 5.0), g, TEXT);
+        }
+    }
+
+    /// A tap on the map: an event marker opens replay there, a camera its
+    /// live view.
+    fn map_tap(&mut self, view: &View, l: &Level, at: Pos2) {
+        // Fingers are blunt: a little more slack than the mouse hint.
+        let marker = self
+            .markers
+            .iter()
+            .filter(|(m, _)| m.distance(at) < 11.0)
+            .min_by(|a, b| a.0.distance(at).total_cmp(&b.0.distance(at)));
+        if let Some((_, i)) = marker {
+            let e = &self.events[*i];
+            self.action = Some(MapAction::Replay {
+                camera: e.camera.clone(),
+                t_ms: e.start_ms as f64,
+            });
+            return;
+        }
+        if let Some(c) = l
+            .cameras
+            .iter()
+            .filter(|c| sp(view, c.at).distance(at) < 18.0)
+            .min_by(|a, b| {
+                sp(view, a.at)
+                    .distance(at)
+                    .total_cmp(&sp(view, b.at).distance(at))
+            })
+        {
+            self.action = Some(MapAction::Live(c.camera.clone()));
         }
     }
 
@@ -1826,6 +2088,25 @@ impl PlanView {
     }
 }
 
+/// ("HH:MM:SS", "YYYY-MM-DD") in the viewer's local time.
+fn local_hms(ms: f64) -> (String, String) {
+    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms));
+    (
+        format!(
+            "{:02}:{:02}:{:02}",
+            d.get_hours(),
+            d.get_minutes(),
+            d.get_seconds()
+        ),
+        format!(
+            "{:04}-{:02}-{:02}",
+            d.get_full_year(),
+            d.get_month() + 1,
+            d.get_date()
+        ),
+    )
+}
+
 fn heading_vec(deg: f64) -> egui::Vec2 {
     let r = deg.to_radians();
     vec2(r.cos() as f32, -(r.sin() as f32))
@@ -2111,9 +2392,19 @@ pub fn draw_level(
         p.circle_filled(at, 7.0, SURFACE);
         p.circle_stroke(at, 7.0, Stroke::new(1.5, col));
         p.circle_filled(at, 2.5, col);
+        // The name goes behind the camera, away from its cone and markers.
+        let side = |v: f32| {
+            if v > 0.3 {
+                egui::Align::Max
+            } else if v < -0.3 {
+                egui::Align::Min
+            } else {
+                egui::Align::Center
+            }
+        };
         p.text(
-            at + vec2(10.0, 8.0),
-            Align2::LEFT_TOP,
+            at - hv * 13.0,
+            Align2([side(hv.x), side(hv.y)]),
             &c.camera,
             theme::mono(11.0),
             TEXT,

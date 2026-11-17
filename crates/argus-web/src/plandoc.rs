@@ -292,6 +292,52 @@ pub fn find(p: &Plan, id: Id) -> Option<(Id, Entity)> {
         .find_map(|l| l.entity(id).map(|e| (l.id, e)))
 }
 
+/// An event as `/api/events` lists it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct MapEvent {
+    pub camera: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub label: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct EventList {
+    pub events: Vec<MapEvent>,
+}
+
+/// Where the `i`th newest of a camera's event markers goes, in screen
+/// points from the camera icon: rows fanning out along its heading, the
+/// newest nearest. `heading` and `fov` in degrees; y points down.
+pub fn marker_offset(i: usize, heading: f64, fov: f64) -> (f32, f32) {
+    // Row r holds 3 + 2r markers.
+    let (mut row, mut first) = (0usize, 0usize);
+    while i >= first + 3 + 2 * row {
+        first += 3 + 2 * row;
+        row += 1;
+    }
+    let n = 3 + 2 * row;
+    let k = i - first;
+    let spread = fov.clamp(30.0, 110.0);
+    // Middle first, then alternating outwards, so few markers sit centred.
+    let order = {
+        let mid = (n - 1) as f64 / 2.0;
+        let step = (k as f64 / 2.0).ceil();
+        let pos = if k % 2 == 1 { mid - step } else { mid + step };
+        pos / (n - 1).max(1) as f64
+    };
+    let a = (heading + (order - 0.5) * spread).to_radians();
+    let r = 30.0 + 14.0 * row as f64;
+    ((r * a.cos()) as f32, (-r * a.sin()) as f32)
+}
+
+/// How opaque an event marker is: 1 when new, fading to 0.2 at the end of
+/// the window.
+pub fn marker_alpha(now_ms: f64, start_ms: f64, window_ms: f64) -> f32 {
+    let age = ((now_ms - start_ms) / window_ms).clamp(0.0, 1.0);
+    (1.0 - 0.8 * age) as f32
+}
+
 /// Triangles (vertex indices) filling a simple polygon, by ear clipping.
 /// Works for concave outlines such as L-shaped rooms.
 pub fn triangulate(poly: &[Point]) -> Vec<[usize; 3]> {
@@ -464,6 +510,26 @@ mod tests {
                 r.name
             );
         }
+    }
+
+    #[test]
+    fn markers_fan_out_without_overlapping() {
+        let pts: Vec<(f32, f32)> = (0..40).map(|i| marker_offset(i, 90.0, 90.0)).collect();
+        // The first sits straight ahead (up, since y points down).
+        assert!(pts[0].0.abs() < 1e-3 && pts[0].1 < -29.0, "{:?}", pts[0]);
+        for (i, a) in pts.iter().enumerate() {
+            for b in &pts[i + 1..] {
+                let d = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+                assert!(d > 9.0, "{a:?} {b:?}");
+            }
+        }
+        assert_eq!(marker_alpha(1000.0, 1000.0, 3_600_000.0), 1.0);
+        assert!((marker_alpha(3_601_000.0, 1000.0, 3_600_000.0) - 0.2).abs() < 1e-6);
+        let list: EventList = serde_json::from_str(
+            r#"{"events":[{"camera":"a","start_ms":1,"end_ms":2,"source":"reolink","label":"person"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(list.events[0].label, "person");
     }
 
     #[test]

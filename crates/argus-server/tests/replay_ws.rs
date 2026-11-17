@@ -248,6 +248,38 @@ async fn get(url: &str, range: Option<&str>) -> (u16, Vec<u8>) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn events_for_the_map() {
+    let s = server().await;
+    {
+        let i = s.index.lock().unwrap();
+        i.add_event("a", s.t0, s.t0 + 5000, "reolink", "person")
+            .unwrap();
+        i.add_event("b", s.t0 + 1000, s.t0 + 2000, "reolink", "vehicle")
+            .unwrap();
+        i.add_event("a", s.t0 - 7_200_000, s.t0 - 7_100_000, "cli", "manual")
+            .unwrap();
+    }
+    let base = format!("http://{}", s.addr);
+    let (st, body) = get(&format!("{base}/api/events?from={}", s.t0 - 60_000), None).await;
+    assert_eq!(st, 200);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let ev = v["events"].as_array().unwrap();
+    assert_eq!(ev.len(), 2, "{v}");
+    assert_eq!(
+        (ev[0]["camera"].as_str(), ev[0]["label"].as_str()),
+        (Some("a"), Some("person"))
+    );
+    assert_eq!(ev[1]["label"], "vehicle");
+    let (_, body) = get(
+        &format!("{base}/api/events?from={}&cameras=b", s.t0 - 60_000),
+        None,
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["events"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn recordings_seek_and_ranged_media() {
     let s = server().await;
     let base = format!("http://{}", s.addr);

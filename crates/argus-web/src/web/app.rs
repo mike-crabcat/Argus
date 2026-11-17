@@ -11,7 +11,7 @@ use eframe::egui::{
 use eframe::egui_wgpu::RenderState;
 
 use super::phones::Phones;
-use super::plan::PlanView;
+use super::plan::{MapAction, PlanView};
 use super::replay::Replay;
 use super::theme::{self, ACCENT, ALERT, BG, LINE, SURFACE, TEXT, TEXT_2, TEXT_3};
 use super::tile::{Status, Tile};
@@ -1008,8 +1008,22 @@ impl eframe::App for App {
                     let names = self.camera_names();
                     let admin = self.phones.is_admin();
                     let full = ui.max_rect().expand(GAP);
-                    if let Some(m) = &mut self.map {
-                        m.ui(ui, full, &names, admin);
+                    let action = self
+                        .map
+                        .as_mut()
+                        .and_then(|m| m.ui(ui, full, &names, admin));
+                    match action {
+                        Some(MapAction::Live(camera)) => {
+                            self.map = None;
+                            self.focus = names.iter().position(|n| *n == camera);
+                        }
+                        Some(MapAction::Replay { camera, t_ms }) => {
+                            self.map = None;
+                            // A few seconds before the event starts.
+                            self.start_replay(ui.ctx(), &rs, t_ms - 3000.0);
+                            self.set_focus(names.iter().position(|n| *n == camera));
+                        }
+                        None => {}
                     }
                     return;
                 }
