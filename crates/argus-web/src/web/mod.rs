@@ -1,6 +1,7 @@
 //! Browser entry point and small web helpers.
 
 mod app;
+mod replay;
 mod theme;
 mod tile;
 
