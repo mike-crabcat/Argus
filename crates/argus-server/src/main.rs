@@ -216,6 +216,9 @@ async fn run(cfg: Config) -> Result<()> {
                 },
             }),
             devices: Some(devices),
+            plan: Some(Arc::new(argus_server::plan::PlanStore::open(
+                &cfg.storage.root,
+            )?)),
             public_url: h
                 .public_url
                 .as_deref()

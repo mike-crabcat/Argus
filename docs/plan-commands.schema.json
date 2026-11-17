@@ -1,0 +1,1028 @@
+{
+  "$defs": {
+    "Background": {
+      "description": "An image under a level (a scanned plan or a site photo), placed by its\nscale, offset and rotation.",
+      "properties": {
+        "asset": {
+          "description": "The uploaded image's id (`/api/plan/assets/{asset}`).",
+          "type": "string"
+        },
+        "mm_per_px": {
+          "description": "Millimetres per image pixel.",
+          "format": "double",
+          "type": "number"
+        },
+        "offset": {
+          "$ref": "#/$defs/Point",
+          "description": "Where the image's top-left corner sits on the plan, mm."
+        },
+        "opacity": {
+          "description": "0 (invisible) to 1.",
+          "format": "double",
+          "type": "number"
+        },
+        "rotation": {
+          "default": 0.0,
+          "description": "Rotation about the top-left corner, degrees CCW.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "asset",
+        "mm_per_px",
+        "offset",
+        "opacity"
+      ],
+      "type": "object"
+    },
+    "CameraPlacement": {
+      "description": "A camera from the Argus config, placed on the plan.",
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/Point"
+        },
+        "camera": {
+          "description": "The camera's `name` in argus.toml.",
+          "type": "string"
+        },
+        "fov": {
+          "description": "Horizontal field of view, degrees.",
+          "format": "double",
+          "type": "number"
+        },
+        "heading": {
+          "description": "Where it points, degrees CCW from +x (east).",
+          "format": "double",
+          "type": "number"
+        },
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "mount_height": {
+          "description": "Height above the floor, mm.",
+          "format": "double",
+          "type": "number"
+        },
+        "range": {
+          "description": "How far it usefully sees, mm (the drawn cone's length).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "camera",
+        "at",
+        "heading",
+        "fov",
+        "range",
+        "mount_height"
+      ],
+      "type": "object"
+    },
+    "Dimension": {
+      "description": "A measured line between two points, drawn `offset` mm to its left.",
+      "properties": {
+        "a": {
+          "$ref": "#/$defs/Point"
+        },
+        "b": {
+          "$ref": "#/$defs/Point"
+        },
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "offset": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "a",
+        "b"
+      ],
+      "type": "object"
+    },
+    "End": {
+      "description": "A wall end: an existing node, or a point (joined to a node or wall\nwithin 1 mm, else a new node).",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "node": {
+              "$ref": "#/$defs/Id"
+            }
+          },
+          "required": [
+            "node"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "at": {
+              "$ref": "#/$defs/Point"
+            }
+          },
+          "required": [
+            "at"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Entity": {
+      "description": "Any entity, for lookups and restores.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Node",
+          "properties": {
+            "type": {
+              "const": "node",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Wall",
+          "properties": {
+            "type": {
+              "const": "wall",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Opening",
+          "properties": {
+            "type": {
+              "const": "opening",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Room",
+          "properties": {
+            "type": {
+              "const": "room",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Dimension",
+          "properties": {
+            "type": {
+              "const": "dimension",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/CameraPlacement",
+          "properties": {
+            "type": {
+              "const": "camera",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Hinge": {
+      "description": "Which end of the opening the door is hinged at, along the wall.",
+      "oneOf": [
+        {
+          "const": "start",
+          "description": "The end nearer the wall's node `a`.",
+          "type": "string"
+        },
+        {
+          "const": "end",
+          "description": "The end nearer the wall's node `b`.",
+          "type": "string"
+        }
+      ]
+    },
+    "Id": {
+      "description": "A stable entity id, unique across the whole plan and never reused.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "Level": {
+      "properties": {
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Background"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "cameras": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CameraPlacement"
+          },
+          "type": "array"
+        },
+        "dimensions": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Dimension"
+          },
+          "type": "array"
+        },
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "nodes": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Node"
+          },
+          "type": "array"
+        },
+        "openings": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Opening"
+          },
+          "type": "array"
+        },
+        "rooms": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Room"
+          },
+          "type": "array"
+        },
+        "walls": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Wall"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "Node": {
+      "description": "A wall end. Walls meeting at a node are joined there (mitred corners).",
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/Point"
+        },
+        "id": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "required": [
+        "id",
+        "at"
+      ],
+      "type": "object"
+    },
+    "Opening": {
+      "description": "A door or window in a wall.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "kind": {
+          "$ref": "#/$defs/OpeningKind"
+        },
+        "offset": {
+          "description": "Distance from the wall's node `a` to the opening's centre, mm.",
+          "format": "double",
+          "type": "number"
+        },
+        "swing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Swing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Doors only; windows have none."
+        },
+        "wall": {
+          "$ref": "#/$defs/Id"
+        },
+        "width": {
+          "description": "Width along the wall, mm.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "wall",
+        "kind",
+        "offset",
+        "width"
+      ],
+      "type": "object"
+    },
+    "OpeningKind": {
+      "enum": [
+        "door",
+        "window"
+      ],
+      "type": "string"
+    },
+    "Point": {
+      "description": "A point in millimetres.",
+      "properties": {
+        "x": {
+          "format": "double",
+          "type": "number"
+        },
+        "y": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y"
+      ],
+      "type": "object"
+    },
+    "Room": {
+      "description": "A named room. Its outline is the enclosed area of walls around `at`,\nunless `polygon` gives one explicitly.",
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/Point",
+          "description": "A point inside the room; also where the label is drawn."
+        },
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "polygon": {
+          "items": {
+            "$ref": "#/$defs/Point"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "at"
+      ],
+      "type": "object"
+    },
+    "Side": {
+      "description": "Which side of a wall, looking from its node `a` towards `b`.",
+      "enum": [
+        "left",
+        "right"
+      ],
+      "type": "string"
+    },
+    "Swing": {
+      "description": "How a door swings: the hinge end and the side it opens towards.",
+      "properties": {
+        "hinge": {
+          "$ref": "#/$defs/Hinge"
+        },
+        "side": {
+          "$ref": "#/$defs/Side"
+        }
+      },
+      "required": [
+        "hinge",
+        "side"
+      ],
+      "type": "object"
+    },
+    "Wall": {
+      "description": "A straight wall along the centreline from node `a` to node `b`.",
+      "properties": {
+        "a": {
+          "$ref": "#/$defs/Id"
+        },
+        "b": {
+          "$ref": "#/$defs/Id"
+        },
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "thickness": {
+          "description": "Thickness, mm.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "a",
+        "b",
+        "thickness"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One edit. Fields named `id` are optional: give one to choose the new\nentity's id (it must be unused), or leave it out to get the next free one.",
+  "oneOf": [
+    {
+      "description": "Adds a level (storey or area such as \"Yard\") at the end.",
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "op": {
+          "const": "add_level",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "name"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "op": {
+          "const": "rename_level",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "name"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Deletes a level and everything on it. The last level can't go.",
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "op": {
+          "const": "delete_level",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "level"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Puts a deleted level back at `index` (the inverse of DeleteLevel).",
+      "properties": {
+        "index": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "level": {
+          "$ref": "#/$defs/Level"
+        },
+        "op": {
+          "const": "restore_level",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "index",
+        "level"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Replaces a level's whole contents (same id). Inverse of the\nstructural edits; also handy for bulk import.",
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/Level"
+        },
+        "op": {
+          "const": "replace_level",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "level"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "A straight wall from `a` to `b` (centreline). Ends given as points\njoin an existing node or wall there, so chains and T-junctions\nconnect.",
+      "properties": {
+        "a": {
+          "$ref": "#/$defs/End"
+        },
+        "b": {
+          "$ref": "#/$defs/End"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "op": {
+          "const": "add_wall",
+          "type": "string"
+        },
+        "thickness": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "a",
+        "b",
+        "thickness"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Moves a wall node (and so every wall ending there).",
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "node": {
+          "$ref": "#/$defs/Id"
+        },
+        "op": {
+          "const": "move_node",
+          "type": "string"
+        },
+        "to": {
+          "$ref": "#/$defs/Point"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "node",
+        "to"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Splits a wall `offset` mm from its node `a` with a new node; the\npart beyond becomes a new wall. Openings follow their part.",
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "new_wall": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "node": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "offset": {
+          "format": "double",
+          "type": "number"
+        },
+        "op": {
+          "const": "split_wall",
+          "type": "string"
+        },
+        "wall": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "wall",
+        "offset"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "A door or window in a wall. `offset` is from the wall's node `a` to\nthe opening's centre.",
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/OpeningKind"
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "offset": {
+          "format": "double",
+          "type": "number"
+        },
+        "op": {
+          "const": "add_opening",
+          "type": "string"
+        },
+        "swing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Swing"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wall": {
+          "$ref": "#/$defs/Id"
+        },
+        "width": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "wall",
+        "kind",
+        "offset",
+        "width"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "A named room around point `at` (or with an explicit outline).",
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/Point"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "op": {
+          "const": "add_room",
+          "type": "string"
+        },
+        "polygon": {
+          "items": {
+            "$ref": "#/$defs/Point"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "name",
+        "at"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "op": {
+          "const": "set_room_name",
+          "type": "string"
+        },
+        "room": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "room",
+        "name"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "a": {
+          "$ref": "#/$defs/Point"
+        },
+        "b": {
+          "$ref": "#/$defs/Point"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "offset": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "op": {
+          "const": "add_dimension",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "a",
+        "b"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Places a camera from the config (by name) on the plan.",
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/Point"
+        },
+        "camera": {
+          "type": "string"
+        },
+        "fov": {
+          "format": "double",
+          "type": "number"
+        },
+        "heading": {
+          "format": "double",
+          "type": "number"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "mount_height": {
+          "format": "double",
+          "type": "number"
+        },
+        "op": {
+          "const": "place_camera",
+          "type": "string"
+        },
+        "range": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "camera",
+        "at",
+        "heading",
+        "fov",
+        "range",
+        "mount_height"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Replaces an entity with new values (same id and type): any field of\na wall, opening, room, dimension or camera, or a node's position.",
+      "properties": {
+        "entity": {
+          "$ref": "#/$defs/Entity"
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "op": {
+          "const": "update_entity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "entity"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Deletes an entity. A node takes its walls with it; a wall takes its\nopenings; nodes left without walls go too.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "op": {
+          "const": "delete_entity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Moves entities by `by`: nodes, walls (their nodes), rooms,\ndimensions and cameras. Openings stay in their walls.",
+      "properties": {
+        "by": {
+          "$ref": "#/$defs/Point"
+        },
+        "ids": {
+          "items": {
+            "$ref": "#/$defs/Id"
+          },
+          "type": "array"
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "op": {
+          "const": "move_entities",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "ids",
+        "by"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Background"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "op": {
+          "const": "set_background",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "level"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Several commands applied together: all or none.",
+      "properties": {
+        "commands": {
+          "items": {
+            "$ref": "#"
+          },
+          "type": "array"
+        },
+        "op": {
+          "const": "batch",
+          "type": "string"
+        }
+      },
+      "required": [
+        "op",
+        "commands"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "Command"
+}

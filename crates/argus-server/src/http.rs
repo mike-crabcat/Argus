@@ -15,6 +15,9 @@
 //!   configured `public_url`, for the viewer.
 //! * `GET /api/devices`, `POST /api/devices` (`{"name": ...}`),
 //!   `DELETE /api/devices/{id}`: phones added by QR code (main token only).
+//! * `GET /api/plan`, `PUT /api/plan`, `POST /api/plan/commands`,
+//!   `POST /api/plan/assets`, `GET /api/plan/assets/{id}`: the floor plan
+//!   (see [`crate::plan`] and docs/plan-commands.md).
 //! * Anything else: static files from `[http] web_root` (the browser app),
 //!   if configured. These need no token; the API does.
 //!
@@ -66,6 +69,8 @@ pub struct AppState {
     pub devices: Option<Arc<crate::devices::Devices>>,
     /// The address phones reach this server at (`[http] public_url`).
     pub public_url: Option<Arc<str>>,
+    /// The floor plan. None disables the plan routes.
+    pub plan: Option<Arc<crate::plan::PlanStore>>,
 }
 
 /// Who made a request, set by the auth middleware.
@@ -127,6 +132,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/info", get(info))
         .route("/api/devices", get(list_devices).post(create_device))
         .route("/api/devices/{id}", axum::routing::delete(revoke_device))
+        .route(
+            "/api/plan",
+            get(crate::plan::get_plan).put(crate::plan::put_plan),
+        )
+        .route(
+            "/api/plan/commands",
+            axum::routing::post(crate::plan::post_commands),
+        )
+        .route(
+            "/api/plan/assets",
+            axum::routing::post(crate::plan::post_asset).layer(
+                axum::extract::DefaultBodyLimit::max(crate::plan::MAX_ASSET_BYTES + 1024),
+            ),
+        )
+        .route("/api/plan/assets/{id}", get(crate::plan::get_asset))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     api.route("/healthz", get(healthz))
         .fallback(static_file)

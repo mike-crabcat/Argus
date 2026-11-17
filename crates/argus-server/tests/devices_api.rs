@@ -27,6 +27,7 @@ async fn server(public_url: Option<&str>) -> Server {
         recordings: None,
         devices: Some(Arc::new(Devices::open(dir.path()).unwrap())),
         public_url: public_url.map(Arc::from),
+        plan: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
