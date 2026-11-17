@@ -1,0 +1,8 @@
+# Build outputs and local state
+target/
+web/dist/
+.git/
+.claude/
+# Never send local configuration (camera passwords) into a build.
+argus.toml
+*.sqlite

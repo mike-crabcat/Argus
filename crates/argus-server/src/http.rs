@@ -55,7 +55,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/cameras", get(cameras))
         .route("/api/live/{camera}/{stream}", get(live_ws))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
-    api.fallback(static_file).with_state(state)
+    api.route("/healthz", get(healthz))
+        .fallback(static_file)
+        .with_state(state)
+}
+
+/// The build this server runs, from the `ARGUS_GIT_SHA` build variable.
+pub const VERSION: &str = match option_env!("ARGUS_GIT_SHA") {
+    Some(v) => v,
+    None => "dev",
+};
+
+/// Liveness for Docker and deploy scripts: no token, no camera details.
+async fn healthz() -> String {
+    format!("ok {VERSION}\n")
 }
 
 /// Serves the browser app's files. Only plain relative paths inside

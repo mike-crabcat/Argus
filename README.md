@@ -78,6 +78,12 @@ ARGUS_TOKEN=... cargo run --release --example live_probe -- \
   `rtsp://USER:PASS@CAM:554/h265Preview_01_main`.
 * Set the I-frame interval to 1x the frame rate so every second is seekable.
 
+### Deploy
+
+The workstation runs the latest `main` automatically: GitHub builds a
+Docker image after CI passes and a timer here pulls it. See
+[docs/deploy.md](docs/deploy.md).
+
 ## Layout
 
 | Crate | Purpose |

@@ -1,0 +1,22 @@
+# Argus on the workstation. Installed to ~/argus-deploy by
+# deploy/install.sh; the image, config and data paths come from .env there.
+name: argus
+services:
+  argus:
+    image: ${ARGUS_IMAGE:-ghcr.io/mike-crabcat/argus:main}
+    container_name: argus
+    restart: unless-stopped
+    user: "1000:1000"
+    # Host networking: the cameras are on the LAN, and [http] listens on
+    # 127.0.0.1 only (tailscale serve adds HTTPS in front).
+    network_mode: host
+    volumes:
+      - ${ARGUS_CONFIG:?set ARGUS_CONFIG}:/etc/argus/argus.toml:ro
+      - ${ARGUS_DATA:?set ARGUS_DATA}:${ARGUS_DATA}
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
