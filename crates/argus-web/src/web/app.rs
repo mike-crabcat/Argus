@@ -13,7 +13,10 @@ use eframe::egui_wgpu::RenderState;
 use super::replay::Replay;
 use super::theme::{self, ACCENT, ALERT, BG, LINE, SURFACE, TEXT, TEXT_2, TEXT_3};
 use super::tile::{Status, Tile};
-use super::{get_text, now_ms, now_us, page_token};
+use super::{
+    UNAUTHORIZED, get_text, now_ms, now_us, page_token, store_token, stored_token,
+    strip_token_from_url,
+};
 use crate::{Camera, CameraList, layout};
 
 const GAP: f32 = 8.0;
@@ -25,6 +28,8 @@ const TIMELINE_H: f32 = 64.0;
 enum Cameras {
     Loading,
     Loaded(Vec<Camera>),
+    /// The server wants a token; the message says why we're asking again.
+    NeedToken(Option<String>),
     Failed(String),
 }
 
@@ -46,6 +51,8 @@ struct TileInfo {
 
 pub struct App {
     token: Option<String>,
+    /// What's typed in the token prompt.
+    token_input: String,
     cameras: Rc<RefCell<Cameras>>,
     tiles: Vec<Tile>,
     replay: Option<Replay>,
@@ -68,21 +75,18 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         super::set_status("");
-        let token = page_token();
+        // A token in the address is remembered in this browser and taken
+        // out of the URL; otherwise use the one remembered earlier.
+        let token = match page_token() {
+            Some(t) => {
+                store_token(Some(&t));
+                strip_token_from_url();
+                Some(t)
+            }
+            None => stored_token(),
+        };
         let cameras = Rc::new(RefCell::new(Cameras::Loading));
-        let (c, t, ctx) = (cameras.clone(), token.clone(), cc.egui_ctx.clone());
-        wasm_bindgen_futures::spawn_local(async move {
-            let result = get_text("/api/cameras", t.as_deref())
-                .await
-                .and_then(|body| {
-                    serde_json::from_str::<CameraList>(&body).map_err(|e| e.to_string())
-                });
-            *c.borrow_mut() = match result {
-                Ok(list) => Cameras::Loaded(list.cameras),
-                Err(e) => Cameras::Failed(e),
-            };
-            ctx.request_repaint();
-        });
+        fetch_cameras(&cameras, token.clone(), &cc.egui_ctx);
         let backend = cc
             .wgpu_render_state
             .as_ref()
@@ -94,6 +98,7 @@ impl App {
             .unwrap_or_else(|| "no GPU".into());
         Self {
             token,
+            token_input: String::new(),
             cameras,
             tiles: Vec::new(),
             replay: None,
@@ -160,6 +165,107 @@ impl App {
             }
         }
         self.focus = f;
+    }
+
+    /// Forgets the token in this browser and closes every stream.
+    fn sign_out(&mut self, rs: &RenderState) {
+        store_token(None);
+        self.token = None;
+        self.token_input.clear();
+        self.stop_replay(rs);
+        for t in self.tiles.iter_mut() {
+            t.release(rs);
+        }
+        self.tiles.clear();
+        self.focus = None;
+        *self.cameras.borrow_mut() = Cameras::NeedToken(None);
+    }
+
+    /// One field and a button, centred, in the app's own style.
+    fn token_prompt(&mut self, ui: &mut egui::Ui, area: Rect, error: Option<String>) {
+        let card = Rect::from_center_size(area.center(), vec2(360.0f32.min(area.width()), 196.0));
+        let p = ui.painter().clone();
+        p.rect_filled(card, CornerRadius::same(theme::TILE_RADIUS), SURFACE);
+        p.rect_stroke(
+            card,
+            CornerRadius::same(theme::TILE_RADIUS),
+            Stroke::new(1.0, LINE),
+            StrokeKind::Inside,
+        );
+        let x = card.left() + 24.0;
+        p.text(
+            pos2(x, card.top() + 28.0),
+            Align2::LEFT_CENTER,
+            "Access token",
+            theme::semibold(17.0),
+            TEXT,
+        );
+        let (msg, color) = match &error {
+            Some(e) => (e.as_str(), ALERT),
+            None => ("This Argus needs its access token.", TEXT_2),
+        };
+        p.text(
+            pos2(x, card.top() + 56.0),
+            Align2::LEFT_CENTER,
+            msg,
+            theme::regular(12.5),
+            color,
+        );
+        let field =
+            Rect::from_min_size(pos2(x, card.top() + 80.0), vec2(card.width() - 48.0, 36.0));
+        let edit = ui.put(
+            field,
+            egui::TextEdit::singleline(&mut self.token_input)
+                .password(true)
+                .hint_text("Paste the token")
+                .font(theme::mono(13.5))
+                .margin(vec2(14.0, 9.0))
+                .desired_width(field.width()),
+        );
+        if !edit.has_focus() && self.token_input.is_empty() {
+            edit.request_focus();
+        }
+        let button = Rect::from_min_size(
+            pos2(card.right() - 24.0 - 96.0, card.bottom() - 24.0 - 32.0),
+            vec2(96.0, 32.0),
+        );
+        let resp = ui.interact(button, ui.scope_id().with("open"), Sense::click());
+        let ready = !self.token_input.trim().is_empty();
+        p.rect_filled(
+            button,
+            CornerRadius::same(theme::PILL_RADIUS),
+            if ready && resp.hovered() {
+                ACCENT
+            } else {
+                SURFACE
+            },
+        );
+        p.rect_stroke(
+            button,
+            CornerRadius::same(theme::PILL_RADIUS),
+            Stroke::new(1.0, if ready { ACCENT } else { LINE }),
+            StrokeKind::Inside,
+        );
+        p.text(
+            button.center(),
+            Align2::CENTER_CENTER,
+            "Open",
+            theme::regular(13.5),
+            if ready && resp.hovered() {
+                BG
+            } else if ready {
+                TEXT
+            } else {
+                TEXT_3
+            },
+        );
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ready && (resp.clicked() || enter) {
+            let token = self.token_input.trim().to_owned();
+            self.token_input.clear();
+            self.token = Some(token.clone());
+            fetch_cameras(&self.cameras, Some(token), ui.ctx());
+        }
     }
 
     fn start_replay(&mut self, ctx: &egui::Context, rs: &RenderState, t_ms: f64) {
@@ -269,6 +375,12 @@ impl App {
         let json = serde_json::json!({
             "backend": self.backend,
             "mode": if self.replay.is_some() { "replay" } else { "live" },
+            "auth": match &*self.cameras.borrow() {
+                Cameras::NeedToken(_) => "token needed",
+                Cameras::Loaded(_) => "ok",
+                Cameras::Loading => "loading",
+                Cameras::Failed(_) => "failed",
+            },
             "focus": focus,
             "tiles": tiles,
             "replay": replay,
@@ -303,6 +415,7 @@ impl App {
             Cameras::Loading => "loading cameras…".to_string(),
             Cameras::Loaded(_) => format!("{n} cameras"),
             Cameras::Failed(_) => "no cameras".to_string(),
+            Cameras::NeedToken(_) => "signed out".to_string(),
         };
         p.text(
             pos2(title.right() + 14.0, cy),
@@ -394,13 +507,27 @@ impl App {
             theme::regular(12.5),
             if self.show_stats { TEXT } else { TEXT_2 },
         );
-        p.text(
+        let backend = p.text(
             pos2(stats_r.left() - 12.0, cy),
             Align2::RIGHT_CENTER,
             &self.backend,
             theme::mono(11.0),
             TEXT_3,
         );
+        // Sign out: forget the token in this browser.
+        if self.token.is_some() && matches!(*self.cameras.borrow(), Cameras::Loaded(_)) {
+            let g = p.layout_no_wrap("Sign out".into(), theme::regular(12.5), TEXT_2);
+            let r = Rect::from_min_size(
+                pos2(backend.left() - 16.0 - g.size().x, cy - g.size().y / 2.0),
+                g.size(),
+            );
+            let resp = ui.interact(r.expand(4.0), id.with("signout"), Sense::click());
+            let color = if resp.hovered() { TEXT } else { TEXT_2 };
+            p.galley(r.min, g, color);
+            if resp.clicked() {
+                self.sign_out(rs);
+            }
+        }
     }
 
     fn tile_info(&mut self, i: usize) -> TileInfo {
@@ -685,6 +812,34 @@ impl App {
     }
 }
 
+/// Loads `/api/cameras` into `cameras`. A token that works is remembered;
+/// a refused one leads to the token prompt.
+fn fetch_cameras(cameras: &Rc<RefCell<Cameras>>, token: Option<String>, ctx: &egui::Context) {
+    *cameras.borrow_mut() = Cameras::Loading;
+    let (c, ctx) = (cameras.clone(), ctx.clone());
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = get_text("/api/cameras", token.as_deref()).await;
+        *c.borrow_mut() = match result {
+            Ok(body) => match serde_json::from_str::<CameraList>(&body) {
+                Ok(list) => {
+                    if token.is_some() {
+                        store_token(token.as_deref());
+                    }
+                    Cameras::Loaded(list.cameras)
+                }
+                Err(e) => Cameras::Failed(e.to_string()),
+            },
+            Err(e) if e == UNAUTHORIZED => Cameras::NeedToken(
+                token
+                    .is_some()
+                    .then(|| "That token didn't work. Check it and try again.".into()),
+            ),
+            Err(e) => Cameras::Failed(e),
+        };
+        ctx.request_repaint();
+    });
+}
+
 /// ("HH:MM:SS", "YYYY-MM-DD") in the viewer's local time zone.
 fn local_time(ms: f64) -> (String, String) {
     let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms));
@@ -739,6 +894,14 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE.fill(BG).inner_margin(GAP))
             .show(ui, |ui| {
                 let area = ui.available_rect_before_wrap();
+                let need = match &*self.cameras.borrow() {
+                    Cameras::NeedToken(e) => Some(e.clone()),
+                    _ => None,
+                };
+                if let Some(error) = need {
+                    self.token_prompt(ui, area, error);
+                    return;
+                }
                 if let Cameras::Failed(e) = &*self.cameras.borrow() {
                     ui.painter().text(
                         area.center(),

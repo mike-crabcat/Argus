@@ -15,6 +15,21 @@ pub mod stats;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
+/// A URL query string (`?a=1&token=x`) without parameter `name`, for
+/// taking the token out of the address bar. Returns "" if nothing is left.
+pub fn without_param(search: &str, name: &str) -> String {
+    let kept: Vec<&str> = search
+        .trim_start_matches('?')
+        .split('&')
+        .filter(|p| !p.is_empty() && p.split('=').next() != Some(name))
+        .collect();
+    if kept.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", kept.join("&"))
+    }
+}
+
 /// A camera as `/api/cameras` describes it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct Camera {
@@ -59,6 +74,15 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_only_the_token_parameter() {
+        assert_eq!(without_param("?token=abc", "token"), "");
+        assert_eq!(without_param("?a=1&token=abc&b=2", "token"), "?a=1&b=2");
+        assert_eq!(without_param("?tokens=1&token", "token"), "?tokens=1");
+        assert_eq!(without_param("", "token"), "");
+        assert_eq!(without_param("?a=1", "token"), "?a=1");
+    }
 
     #[test]
     fn parses_camera_list_and_picks_streams() {

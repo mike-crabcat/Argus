@@ -53,6 +53,55 @@ pub(crate) fn now_ms() -> f64 {
     web_sys::window().unwrap().performance().unwrap().now()
 }
 
+/// What [`get_text`] returns when the server wants a (different) token.
+pub(crate) const UNAUTHORIZED: &str = "unauthorized";
+
+const TOKEN_KEY: &str = "argus.token";
+
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
+}
+
+/// The token remembered in this browser, if any.
+pub(crate) fn stored_token() -> Option<String> {
+    local_storage()?
+        .get_item(TOKEN_KEY)
+        .ok()
+        .flatten()
+        .filter(|t| !t.is_empty())
+}
+
+/// Remembers (or with `None`, forgets) the token in this browser. Storage
+/// may be unavailable (private windows); that only means asking again.
+pub(crate) fn store_token(token: Option<&str>) {
+    if let Some(s) = local_storage() {
+        let _ = match token {
+            Some(t) => s.set_item(TOKEN_KEY, t),
+            None => s.remove_item(TOKEN_KEY),
+        };
+    }
+}
+
+/// Takes `?token=` out of the address bar (and so out of history and
+/// anything copied from it), keeping the rest of the URL.
+pub(crate) fn strip_token_from_url() {
+    let Some(w) = web_sys::window() else { return };
+    let loc = w.location();
+    let (Ok(path), Ok(search), Ok(hash)) = (loc.pathname(), loc.search(), loc.hash()) else {
+        return;
+    };
+    let rest = crate::without_param(&search, "token");
+    if rest != search {
+        if let Ok(h) = w.history() {
+            let _ = h.replace_state_with_url(
+                &wasm_bindgen::JsValue::NULL,
+                "",
+                Some(&format!("{path}{rest}{hash}")),
+            );
+        }
+    }
+}
+
 /// `?token=` from the page URL, forwarded to the API.
 pub(crate) fn page_token() -> Option<String> {
     let search = web_sys::window()?.location().search().ok()?;
@@ -98,7 +147,7 @@ pub(crate) async fn get_text(path: &str, token: Option<&str>) -> Result<String, 
         .dyn_into()
         .map_err(|_| "not a Response".to_string())?;
     if resp.status() == 401 {
-        return Err("Access denied: open this page with ?token=YOUR_TOKEN".into());
+        return Err(UNAUTHORIZED.into());
     }
     if !resp.ok() {
         return Err(format!("{path}: HTTP {}", resp.status()));

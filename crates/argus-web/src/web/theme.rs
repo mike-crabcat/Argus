@@ -64,6 +64,7 @@ pub fn apply(ctx: &egui::Context) {
     v.panel_fill = BG;
     v.window_fill = SURFACE;
     v.extreme_bg_color = BG;
+    v.text_edit_bg_color = Some(BG);
     v.faint_bg_color = SURFACE;
     v.override_text_color = Some(TEXT);
     v.selection.bg_fill = ACCENT.linear_multiply(0.3);
@@ -86,5 +87,9 @@ pub fn apply(ctx: &egui::Context) {
     }
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
     v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
-    ctx.set_visuals(v);
+    // The design is dark only; egui would otherwise follow the system
+    // theme and draw widgets (text fields) with its light visuals.
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.set_visuals_of(egui::Theme::Light, v.clone());
+    ctx.set_visuals_of(egui::Theme::Dark, v);
 }
