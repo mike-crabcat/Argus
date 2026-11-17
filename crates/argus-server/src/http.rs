@@ -63,6 +63,17 @@ pub struct AppState {
 pub struct Recordings {
     pub index: Arc<std::sync::Mutex<argus_store::Index>>,
     pub root: Arc<PathBuf>,
+    /// Object storage, for chunks no longer on local disk.
+    pub remote: Option<Arc<dyn object_store::ObjectStore>>,
+}
+
+impl Recordings {
+    pub fn media(&self) -> crate::replay::Media {
+        crate::replay::Media {
+            root: self.root.clone(),
+            remote: self.remote.clone(),
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {

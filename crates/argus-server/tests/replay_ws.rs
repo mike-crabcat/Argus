@@ -19,18 +19,24 @@ fn t0() -> i64 {
 }
 
 /// 30 s of 10 fps video per camera, 1 s GOPs, 10 s chunks. Camera "b"'s
-/// frames are captured 20 ms after "a"'s.
+/// frames are captured 20 ms after "a"'s. Sub frames are 40 bytes; camera
+/// "a" also has a main stream with 80-byte frames.
 fn record(root: &std::path::Path, index: &Arc<Mutex<Index>>, t0: i64) {
     let cfg = VideoConfig::from_avcc(&[1, 0x4d, 0, 0x1f, 0xff, 0xe0, 0], 640, 360).unwrap();
-    for (cam, offset_ms) in [("a", 0), ("b", 20)] {
-        let mut w = ChunkWriter::new(root, cam, "sub", 10, index.clone());
-        w.on_config(&cfg).unwrap();
+    let main = VideoConfig::from_avcc(&[1, 0x64, 0, 0x33, 0xff, 0xe0, 0], 2560, 1920).unwrap();
+    for (cam, stream, cfg, size, offset_ms) in [
+        ("a", "sub", &cfg, 40, 0),
+        ("b", "sub", &cfg, 40, 20),
+        ("a", "main", &main, 80, 0),
+    ] {
+        let mut w = ChunkWriter::new(root, cam, stream, 10, index.clone());
+        w.on_config(cfg).unwrap();
         for i in 0..300i64 {
             w.on_frame(Frame {
                 pts_90k: i * 9000,
                 wall_us: (t0 + offset_ms + i * 100) * 1000,
                 keyframe: i % 10 == 0,
-                data: Bytes::from(vec![i as u8; 40]),
+                data: Bytes::from(vec![i as u8; size]),
             })
             .unwrap();
         }
@@ -41,16 +47,26 @@ fn record(root: &std::path::Path, index: &Arc<Mutex<Index>>, t0: i64) {
 struct Server {
     addr: String,
     t0: i64,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
+    index: Arc<Mutex<Index>>,
 }
 
 async fn server() -> Server {
+    server_with(None, |_, _| {}).await
+}
+
+/// `prepare` runs after recording, before the server starts.
+async fn server_with(
+    remote: Option<Arc<dyn object_store::ObjectStore>>,
+    prepare: impl FnOnce(&std::path::Path, &Arc<Mutex<Index>>),
+) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let index = Arc::new(Mutex::new(
         Index::open(&dir.path().join("index.sqlite")).unwrap(),
     ));
     let t0 = t0();
     record(dir.path(), &index, t0);
+    prepare(dir.path(), &index);
     let mut live = Live::default();
     live.add(LiveStream::new("a", "sub", 16));
     live.add(LiveStream::new("b", "sub", 16));
@@ -59,8 +75,9 @@ async fn server() -> Server {
         token: Some(Arc::from(TOKEN)),
         web_root: None,
         recordings: Some(Recordings {
-            index,
+            index: index.clone(),
             root: Arc::new(dir.path().to_owned()),
+            remote,
         }),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -69,7 +86,8 @@ async fn server() -> Server {
     Server {
         addr,
         t0,
-        _dir: dir,
+        dir,
+        index,
     }
 }
 
@@ -91,7 +109,7 @@ async fn next(ws: &mut Ws) -> Option<Msg> {
             Message::Text(t) => return Some(Msg::Text(serde_json::from_str(&t).unwrap())),
             Message::Binary(b) => {
                 let (h, au) = argus_proto::parse_replay_frame(&b).unwrap();
-                assert_eq!(au.len(), 40);
+                assert!(au.len() == 40 || au.len() == 80, "{}", au.len());
                 return Some(Msg::Frame(h));
             }
             _ => continue,
@@ -289,4 +307,176 @@ async fn recordings_seek_and_ranged_media() {
             .0,
         404
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn focus_switches_one_camera_to_its_main_stream() {
+    let s = server().await;
+    let t = s.t0 + 12_500;
+    let url = format!(
+        "ws://{}/api/replay?t={t}&stream=sub&cameras=a,b&token={TOKEN}",
+        s.addr
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let _ = drain(&mut ws, Duration::from_millis(400)).await;
+    ws.send(Message::Text(
+        r#"{"type":"stream","camera":"a","stream":"main"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    // Everything after the acknowledgement for camera a is main.
+    loop {
+        match next(&mut ws).await.expect("stream reply") {
+            Msg::Text(m) if m["type"] == "stream" => {
+                assert_eq!(
+                    (m["camera"].as_str(), m["stream"].as_str()),
+                    (Some("a"), Some("main"))
+                );
+                break;
+            }
+            _ => continue,
+        }
+    }
+    // Read raw messages here to see access unit sizes (sub 40, main 80).
+    let (mut cfg, mut frames) = (None, Vec::new());
+    let end = tokio::time::Instant::now() + Duration::from_millis(600);
+    while let Ok(Some(Ok(m))) = tokio::time::timeout_at(end, ws.next()).await {
+        match m {
+            Message::Text(t) => {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "config" {
+                    cfg = Some(v);
+                }
+            }
+            Message::Binary(b) => {
+                let (h, au) = argus_proto::parse_replay_frame(&b).unwrap();
+                frames.push((h, au.len()));
+            }
+            _ => {}
+        }
+    }
+    let cfg = cfg.expect("main config");
+    assert_eq!(
+        (cfg["camera"].as_str(), cfg["width"].as_u64()),
+        (Some("a"), Some(2560))
+    );
+    let first_a = frames.iter().find(|(h, _)| h.camera == 0).unwrap();
+    assert!(first_a.0.keyframe, "main restarts on a keyframe");
+    assert!(
+        frames
+            .iter()
+            .filter(|(h, _)| h.camera == 0)
+            .all(|(_, l)| *l == 80)
+    );
+    assert!(
+        frames
+            .iter()
+            .filter(|(h, _)| h.camera == 1)
+            .all(|(_, l)| *l == 40)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plays_chunks_that_are_only_in_object_storage() {
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    // Upload camera a's sub chunks and its init segment, then evict them
+    // locally, exactly as the uploader and eviction would.
+    let uploads = Arc::new(Mutex::new(Vec::new()));
+    let up = uploads.clone();
+    let s = server_with(Some(store.clone()), move |root, index| {
+        let idx = index.lock().unwrap();
+        for c in idx.local_chunks_oldest_first(None, 100).unwrap() {
+            if c.camera != "a" || c.stream != "sub" {
+                continue;
+            }
+            let (init_key, _) = idx.init_upload_state(c.init_id).unwrap();
+            for (key, is_init) in [(c.object_key.clone(), false), (init_key, true)] {
+                let remote = format!("nvr/{key}");
+                if let Ok(bytes) = std::fs::read(root.join(&key)) {
+                    up.lock().unwrap().push((remote.clone(), bytes));
+                    let _ = std::fs::remove_file(root.join(&key));
+                }
+                if is_init {
+                    idx.mark_init_uploaded(c.init_id, &remote, 1).unwrap();
+                } else {
+                    idx.mark_chunk_uploaded(c.id, &remote, 1).unwrap();
+                    idx.set_tier(c.id, "remote").unwrap();
+                }
+            }
+        }
+    })
+    .await;
+    let pending: Vec<_> = uploads.lock().unwrap().drain(..).collect();
+    for (key, bytes) in pending {
+        store
+            .put(
+                &object_store::path::Path::from(key),
+                PutPayload::from(bytes),
+            )
+            .await
+            .unwrap();
+    }
+    fn m4s(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).map_or(0, |d| {
+            d.flatten()
+                .map(|e| {
+                    let p = e.path();
+                    if p.is_dir() {
+                        m4s(&p)
+                    } else {
+                        usize::from(p.extension().is_some_and(|x| x == "m4s"))
+                    }
+                })
+                .sum()
+        })
+    }
+    let local_a = m4s(&s.dir.path().join("rec/a/sub"));
+    assert_eq!(local_a, 0, "camera a's sub chunks are gone locally");
+
+    let t = s.t0 + 12_500;
+    let url = format!(
+        "ws://{}/api/replay?t={t}&stream=sub&cameras=a&token={TOKEN}",
+        s.addr
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let (texts, frames) = drain(&mut ws, Duration::from_millis(600)).await;
+    assert!(
+        texts.iter().any(|t| t["type"] == "config"),
+        "config from the remote init"
+    );
+    assert!(frames[0].keyframe);
+    assert_eq!(ms(&frames[0]), s.t0 + 12_000);
+    // Crossing into the next chunk (also remote) keeps going.
+    ws.send(Message::Text(
+        format!(r#"{{"type":"seek","t_ms":{},"seq":1}}"#, s.t0 + 19_600).into(),
+    ))
+    .await
+    .unwrap();
+    let (_, frames) = drain(&mut ws, Duration::from_millis(1500)).await;
+    assert!(
+        frames.iter().any(|h| ms(h) >= s.t0 + 20_000),
+        "played into the next remote chunk"
+    );
+
+    // /api/media serves a GOP of an evicted chunk by range from storage.
+    let seek = s
+        .index
+        .lock()
+        .unwrap()
+        .seek("a", "sub", s.t0 + 12_500)
+        .unwrap()
+        .unwrap();
+    let range = format!(
+        "bytes={}-{}",
+        seek.byte_offset,
+        seek.byte_offset + seek.byte_len - 1
+    );
+    let (st, body) = get(
+        &format!("http://{}/api/media/{}", s.addr, seek.object_key),
+        Some(&range),
+    )
+    .await;
+    assert_eq!((st, body.len() as u64), (206, seek.byte_len));
+    assert_eq!(&body[4..8], b"moof");
 }

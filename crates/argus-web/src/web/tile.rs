@@ -435,7 +435,7 @@ fn on_text(s: &Rc<RefCell<Shared>>, text: &str) {
             }
         }
         ServerText::Discontinuity => sh.waiting_key = true,
-        ServerText::Replay { .. } => {} // replay socket only
+        ServerText::Replay { .. } | ServerText::Stream { .. } => {} // replay socket only
         ServerText::Pong {
             client_us,
             server_us,

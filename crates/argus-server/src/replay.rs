@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use argus_media::fmp4::{self, Sample};
 use argus_proto::{ReplayHeader, ServerText};
-use argus_store::{ChunkRecord, Index};
+use argus_store::{Index, ReplayChunk};
 use bytes::{Bytes, BytesMut};
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// How far ahead of the master clock frames are sent. Enough to hide a
@@ -77,14 +78,57 @@ pub enum Item {
     Frame(Bytes),
 }
 
+/// Where recorded bytes come from: the local file when it's there, else
+/// object storage (chunks evicted after upload, or files lost locally).
+#[derive(Clone)]
+pub struct Media {
+    pub root: Arc<PathBuf>,
+    pub remote: Option<Arc<dyn ObjectStore>>,
+}
+
+impl Media {
+    /// `len` bytes at `offset` of `key` (all of it with `None`), falling
+    /// back to `remote_key` in object storage if the local file is gone.
+    pub async fn read(
+        &self,
+        key: &str,
+        remote_key: Option<&str>,
+        range: Option<(u64, usize)>,
+    ) -> Result<Bytes> {
+        let path = self.root.join(key);
+        let local = match range {
+            Some((offset, len)) => read_range(&path, offset, len).await,
+            None => tokio::fs::read(&path).await.map(Bytes::from),
+        };
+        match local {
+            Ok(b) => Ok(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(store), Some(rk)) = (&self.remote, remote_key) else {
+                    return Err(e).with_context(|| format!("{key} is not on local disk"));
+                };
+                let loc = object_store::path::Path::from(rk);
+                let bytes = match range {
+                    Some((offset, len)) => store.get_range(&loc, offset..offset + len as u64).await,
+                    None => match store.get(&loc).await {
+                        Ok(r) => r.bytes().await,
+                        Err(e) => Err(e),
+                    },
+                };
+                bytes.with_context(|| format!("reading {rk} from object storage"))
+            }
+            Err(e) => Err(e).with_context(|| format!("reading {key}")),
+        }
+    }
+}
+
 /// Reads one camera's recordings forward from a time, GOP by GOP.
 pub struct Cursor {
     pub index_in_list: u8,
     pub camera: String,
-    stream: String,
-    root: PathBuf,
+    pub stream: String,
+    media: Media,
     index: Arc<Mutex<Index>>,
-    chunks: VecDeque<(ChunkRecord, String)>,
+    chunks: VecDeque<ReplayChunk>,
     /// GOP to read next in the front chunk.
     next_gop: usize,
     frames: VecDeque<Sample>,
@@ -99,7 +143,7 @@ impl Cursor {
         index_in_list: u8,
         camera: &str,
         stream: &str,
-        root: &Path,
+        media: &Media,
         index: Arc<Mutex<Index>>,
         t_ms: i64,
     ) -> Result<Self> {
@@ -107,7 +151,7 @@ impl Cursor {
             index_in_list,
             camera: camera.to_owned(),
             stream: stream.to_owned(),
-            root: root.to_owned(),
+            media: media.clone(),
             index,
             chunks: VecDeque::new(),
             next_gop: 0,
@@ -118,7 +162,7 @@ impl Cursor {
         };
         c.refill()?;
         // Start at the GOP containing t (or the first GOP of a later chunk).
-        if let Some((chunk, _)) = c.chunks.front() {
+        if let Some(chunk) = c.chunks.front().map(|r| &r.chunk) {
             if t_ms > chunk.start_ms {
                 let offset = u32::try_from(t_ms - chunk.start_ms).unwrap_or(u32::MAX);
                 c.next_gop = argus_store::gop_index::find(&chunk.gops, offset).unwrap_or(0);
@@ -129,22 +173,27 @@ impl Cursor {
 
     fn refill(&mut self) -> Result<()> {
         self.last_refill = Some(Instant::now());
-        let more = self.index.lock().unwrap().local_chunks_from(
+        let more = self.index.lock().unwrap().replay_chunks_from(
             &self.camera,
             &self.stream,
             self.resume_ms,
             4,
         )?;
-        for (chunk, init) in more {
+        for rc in more {
             if self
                 .chunks
                 .iter()
-                .any(|(c, _)| c.object_key == chunk.object_key)
+                .any(|c| c.chunk.object_key == rc.chunk.object_key)
             {
                 continue;
             }
-            self.resume_ms = chunk.end_ms;
-            self.chunks.push_back((chunk, init));
+            // Only in object storage, and no store configured: skip it.
+            if !rc.local && self.media.remote.is_none() {
+                self.resume_ms = rc.chunk.end_ms;
+                continue;
+            }
+            self.resume_ms = rc.chunk.end_ms;
+            self.chunks.push_back(rc);
         }
         Ok(())
     }
@@ -163,7 +212,7 @@ impl Cursor {
     /// Reads the next GOP into `frames`. False if there is none yet.
     async fn load_gop(&mut self) -> Result<bool> {
         loop {
-            let Some((chunk, _)) = self.chunks.front() else {
+            let Some(rc) = self.chunks.front() else {
                 // At the end of what's recorded: look again now and then,
                 // since recording continues while we play.
                 let due = self
@@ -178,6 +227,7 @@ impl Cursor {
                 }
                 continue;
             };
+            let chunk = &rc.chunk;
             let Some(gop) = chunk.gops.get(self.next_gop).copied() else {
                 self.chunks.pop_front();
                 self.next_gop = 0;
@@ -186,11 +236,16 @@ impl Cursor {
                 }
                 continue;
             };
-            let path = self.root.join(&chunk.object_key);
+            let (key, remote) = (chunk.object_key.clone(), rc.remote.clone());
             self.next_gop += 1;
-            let bytes = read_range(&path, u64::from(gop.byte_offset), gop.byte_len as usize)
-                .await
-                .with_context(|| format!("reading {}", chunk.object_key))?;
+            let bytes = self
+                .media
+                .read(
+                    &key,
+                    remote.as_deref(),
+                    Some((u64::from(gop.byte_offset), gop.byte_len as usize)),
+                )
+                .await?;
             if let Some(samples) = fmp4::read_video_samples(&bytes) {
                 self.frames.extend(samples);
                 return Ok(true);
@@ -202,13 +257,18 @@ impl Cursor {
     /// its init segment differs from the last one sent.
     pub async fn next_items(&mut self) -> Result<Vec<Item>> {
         let mut out = Vec::new();
-        let init = self.chunks.front().map(|(_, i)| i.clone());
+        let init = self
+            .chunks
+            .front()
+            .map(|c| (c.init_key.clone(), c.init_remote.clone()));
         let Some(sample) = self.frames.pop_front() else {
             return Ok(out);
         };
-        if let Some(init) = init {
+        if let Some((init, init_remote)) = init {
             if self.sent_init.as_ref() != Some(&init) {
-                out.push(Item::Config(self.config(&init).await?));
+                out.push(Item::Config(
+                    self.config(&init, init_remote.as_deref()).await?,
+                ));
                 self.sent_init = Some(init);
             }
         }
@@ -225,10 +285,8 @@ impl Cursor {
         Ok(out)
     }
 
-    async fn config(&self, init_key: &str) -> Result<ServerText> {
-        let init = tokio::fs::read(self.root.join(init_key))
-            .await
-            .with_context(|| format!("reading {init_key}"))?;
+    async fn config(&self, init_key: &str, init_remote: Option<&str>) -> Result<ServerText> {
+        let init = self.media.read(init_key, init_remote, None).await?;
         let record =
             fmp4::decoder_record_from_init(&init).context("init segment has no avcC/hvcC")?;
         let (codec, width, height) = self
@@ -378,10 +436,23 @@ pub mod http {
         if !safe {
             return StatusCode::NOT_FOUND.into_response();
         }
-        let path = rec.root.join(&key);
-        let len = match tokio::fs::metadata(&path).await {
+        let media = rec.media();
+        let remote = rec.index.lock().unwrap().remote_key_of(&key).ok().flatten();
+        // Size: the local file's, else the object's in storage.
+        let len = match tokio::fs::metadata(rec.root.join(&key)).await {
             Ok(m) => m.len(),
-            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => match (&rec.remote, &remote) {
+                (Some(store), Some(rk)) => {
+                    match store
+                        .head(&object_store::path::Path::from(rk.as_str()))
+                        .await
+                    {
+                        Ok(meta) => meta.size,
+                        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            },
         };
         let ctype = if key.ends_with(".mp4") {
             "video/mp4"
@@ -402,31 +473,36 @@ pub mod http {
                 };
                 (a <= b && b < len).then_some((a, b))
             });
-        match range {
-            Some((a, b)) => match read_range(&path, a, (b - a + 1) as usize).await {
-                Ok(body) => (
-                    StatusCode::PARTIAL_CONTENT,
-                    [
-                        (header::CONTENT_TYPE, ctype.to_string()),
-                        (header::CONTENT_RANGE, format!("bytes {a}-{b}/{len}")),
-                        (header::ACCEPT_RANGES, "bytes".to_string()),
-                    ],
-                    body,
-                )
-                    .into_response(),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            },
-            None => match tokio::fs::read(&path).await {
-                Ok(body) => (
-                    [
-                        (header::CONTENT_TYPE, ctype.to_string()),
-                        (header::ACCEPT_RANGES, "bytes".to_string()),
-                    ],
-                    body,
-                )
-                    .into_response(),
-                Err(_) => StatusCode::NOT_FOUND.into_response(),
-            },
+        let read = media
+            .read(
+                &key,
+                remote.as_deref(),
+                range.map(|(a, b)| (a, (b - a + 1) as usize)),
+            )
+            .await;
+        match (range, read) {
+            (Some((a, b)), Ok(body)) => (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, ctype.to_string()),
+                    (header::CONTENT_RANGE, format!("bytes {a}-{b}/{len}")),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                ],
+                body,
+            )
+                .into_response(),
+            (None, Ok(body)) => (
+                [
+                    (header::CONTENT_TYPE, ctype.to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                ],
+                body,
+            )
+                .into_response(),
+            (_, Err(e)) => {
+                warn!("media {key}: {e:#}");
+                StatusCode::BAD_GATEWAY.into_response()
+            }
         }
     }
 
@@ -465,14 +541,17 @@ pub mod http {
         let (mut sink, mut incoming) = socket.split();
         let mut master = Master::new(t, playing);
         let mut seq = 0u32;
-        let open = |t: i64| -> Result<Vec<Cursor>> {
+        let media = rec.media();
+        // Each camera's stream; one can switch (e.g. to main when focused).
+        let mut streams: Vec<String> = vec![stream.clone(); cameras.len()];
+        let open = |t: i64, streams: &[String]| -> Result<Vec<Cursor>> {
             cameras
                 .iter()
                 .enumerate()
-                .map(|(i, c)| Cursor::new(i as u8, c, &stream, &rec.root, rec.index.clone(), t))
+                .map(|(i, c)| Cursor::new(i as u8, c, &streams[i], &media, rec.index.clone(), t))
                 .collect()
         };
-        let mut cursors = open(t)?;
+        let mut cursors = open(t, &streams)?;
         sink.send(text(&ServerText::Replay {
             seq,
             t_ms: t,
@@ -511,7 +590,7 @@ pub mod http {
                             Ok(argus_proto::ClientText::Seek { t_ms, seq: s }) => {
                                 seq = s;
                                 master.seek(t_ms);
-                                cursors = open(t_ms)?;
+                                cursors = open(t_ms, &streams)?;
                                 sink.send(text(&ServerText::Replay {
                                     seq,
                                     t_ms,
@@ -519,6 +598,23 @@ pub mod http {
                                     cameras: cameras.clone(),
                                 }))
                                 .await?;
+                            }
+                            Ok(argus_proto::ClientText::Stream { camera, stream: want }) => {
+                                if let Some(i) = cameras.iter().position(|c| *c == camera) {
+                                    // Restart just this camera, on the other
+                                    // stream, from where playback is now.
+                                    streams[i] = want.clone();
+                                    cursors[i] = Cursor::new(
+                                        i as u8,
+                                        &camera,
+                                        &want,
+                                        &media,
+                                        rec.index.clone(),
+                                        master.now_ms(),
+                                    )?;
+                                    sink.send(text(&ServerText::Stream { camera, stream: want }))
+                                        .await?;
+                                }
                             }
                             Ok(argus_proto::ClientText::Play) => master.set_playing(true),
                             Ok(argus_proto::ClientText::Pause) => master.set_playing(false),

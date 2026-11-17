@@ -161,8 +161,19 @@ the target) it skips to the next keyframe rather than drift out of sync.
 The Replay switch in the top bar opens it; the timeline shows the last hour
 with recorded spans; Space plays/pauses, ←/→ jump 10 s.
 
-Not yet: replay of the main streams, chunks that are only in S3, speeds
-other than 1×, reverse, or scrubbing previews.
+Double-click a replay tile to show that camera full window: the client
+sends `{"type":"stream","camera":…,"stream":"main"}`, the server restarts
+just that camera's cursor on its main stream at the playhead and answers
+with a `stream` message (the client drops that camera's frames until then);
+leaving focus switches it back to `sub`.
+
+Replay reads each GOP from the local chunk file when it is there and
+otherwise from object storage by byte range (`[s3]`, using the `remote`
+key the uploader recorded), so footage evicted from local disk still plays.
+Init segments and `/api/media` fall back the same way.
+
+Not yet: speeds other than 1×, reverse, scrubbing previews, or presigned
+URLs (S3 reads go through the server).
 
 ## Phases
 

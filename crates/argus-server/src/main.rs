@@ -196,6 +196,10 @@ async fn run(cfg: Config) -> Result<()> {
             recordings: Some(http::Recordings {
                 index: index.clone(),
                 root: Arc::new(cfg.storage.root.clone()),
+                remote: match &cfg.s3 {
+                    Some(s3cfg) => Some(s3::connect(s3cfg)?),
+                    None => None,
+                },
             }),
         };
         info!(listen = %h.listen, auth = h.token.is_some(), version = http::VERSION,

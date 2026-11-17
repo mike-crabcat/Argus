@@ -160,6 +160,12 @@ pub enum ServerText {
         client_us: i64,
         server_us: i64,
     },
+    /// Replay socket: `camera` now plays `stream` (after a client `stream`
+    /// request). Its frames before this message are from the old stream.
+    Stream {
+        camera: String,
+        stream: String,
+    },
     /// Replay socket: playback (re)starts at `t_ms` for these cameras.
     /// Binary frames that follow refer to cameras by index in this list;
     /// frames received before it belong to an earlier `seq` and are stale.
@@ -186,6 +192,12 @@ pub enum ClientText {
     },
     Play,
     Pause,
+    /// Replay: play `camera` from `stream` (e.g. `main` when it is shown
+    /// full window), from the current position.
+    Stream {
+        camera: String,
+        stream: String,
+    },
 }
 
 /// Estimates `server clock - client clock` from ping/pong round trips,

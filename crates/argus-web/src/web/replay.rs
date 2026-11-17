@@ -62,6 +62,11 @@ struct Dec {
     codec: Option<String>,
     /// Wall time (ms) of the last frame received for this camera.
     last_recv_ms: Option<f64>,
+    /// Waiting for the server to confirm a stream switch; frames until
+    /// then are from the old stream.
+    switching: bool,
+    /// The stream this camera plays.
+    stream: String,
     /// Frames skipped because the decoder fell behind.
     skipped: u64,
     _on_output: Closure<dyn FnMut(VideoFrame)>,
@@ -203,6 +208,31 @@ impl Replay {
         self.spread.clear();
     }
 
+    /// Plays camera `i` from `stream` (main when it's shown full window).
+    pub fn set_stream(&mut self, i: usize, stream: &str) {
+        let mut sh = self.shared.borrow_mut();
+        let Some(camera) = sh.cameras.get(i).cloned() else {
+            return;
+        };
+        let Some(d) = sh.decs.get_mut(i) else { return };
+        if d.stream == stream {
+            return;
+        }
+        d.stream = stream.to_owned();
+        d.switching = true;
+        d.clear();
+        if d.decoder.state() != CodecState::Closed {
+            let _ = d.decoder.reset();
+        }
+        d.configured = false;
+        d.waiting_key = true;
+        let msg = ClientText::Stream {
+            camera,
+            stream: stream.to_owned(),
+        };
+        let _ = self.ws.send_with_str(&serde_json::to_string(&msg).unwrap());
+    }
+
     pub fn set_playing(&mut self, playing: bool) {
         let mut sh = self.shared.borrow_mut();
         if sh.master.playing == playing {
@@ -317,6 +347,8 @@ impl Replay {
             "decode_queue": sh.decs.iter().map(|d| d.decoder.decode_queue_size()).collect::<Vec<_>>(),
             "ready": sh.decs.iter().map(|d| d.ready.len()).collect::<Vec<_>>(),
             "skipped": sh.decs.iter().map(|d| d.skipped).collect::<Vec<_>>(),
+            "streams": sh.decs.iter().map(|d| d.stream.clone()).collect::<Vec<_>>(),
+            "sizes": self.textures.iter().map(|t| t.as_ref().map(|t| t.id_and_size().1)).collect::<Vec<_>>(),
             "ready_span_ms": sh.decs.iter().map(|d| d.ready.front().zip(d.ready.back()).map(|(a, b)| (b.timestamp() - a.timestamp()) / 1000.0)).collect::<Vec<_>>(),
             "sync_spread_ms": {"p50": pct(0.5), "p95": pct(0.95), "max": pct(1.0), "samples": spread.len()},
             "error": sh.error,
@@ -389,6 +421,8 @@ fn new_dec(s: &Rc<RefCell<Shared>>, i: usize) -> Option<Dec> {
         ready: VecDeque::new(),
         codec: None,
         last_recv_ms: None,
+        switching: false,
+        stream: "sub".into(),
         skipped: 0,
         _on_output: on_output,
         _on_error: on_error,
@@ -460,6 +494,12 @@ fn on_text(s: &Rc<RefCell<Shared>>, text: &str) {
                 None => {}
             }
         }
+        ServerText::Stream { camera, .. } => {
+            let mut sh = s.borrow_mut();
+            if let Some(i) = sh.cameras.iter().position(|c| *c == camera) {
+                sh.decs[i].switching = false;
+            }
+        }
         _ => {}
     }
 }
@@ -486,7 +526,7 @@ fn on_binary(s: &Rc<RefCell<Shared>>, buf: &ArrayBuffer) {
         return;
     };
     d.last_recv_ms = Some(h.wall_us as f64 / 1000.0);
-    if !d.configured || d.decoder.state() != CodecState::Configured {
+    if d.switching || !d.configured || d.decoder.state() != CodecState::Configured {
         return;
     }
     if !h.keyframe && (d.waiting_key || d.decoder.decode_queue_size() > limit) {
