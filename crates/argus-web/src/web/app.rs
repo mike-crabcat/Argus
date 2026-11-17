@@ -24,6 +24,8 @@ pub struct App {
     token: Option<String>,
     cameras: Rc<RefCell<Cameras>>,
     tiles: Vec<Tile>,
+    /// Where each tile was drawn last frame, in CSS pixels (for stats).
+    tile_rects: Vec<(usize, Rect)>,
     /// Index of the camera shown full window (on its main stream).
     focus: Option<usize>,
     show_stats: bool,
@@ -63,6 +65,7 @@ impl App {
             token,
             cameras,
             tiles: Vec::new(),
+            tile_rects: Vec::new(),
             focus: None,
             show_stats: true,
             backend,
@@ -108,10 +111,16 @@ impl App {
             return;
         }
         self.last_stats_ms = now;
+        let rects = self.tile_rects.clone();
         let tiles: Vec<_> = self
             .tiles
             .iter_mut()
-            .map(|t| {
+            .enumerate()
+            .map(|(i, t)| {
+                let rect = rects
+                    .iter()
+                    .find(|(j, _)| *j == i)
+                    .map(|(_, r)| [r.min.x, r.min.y, r.width(), r.height()]);
                 let (decoded, received) = (t.decoded_fps(), t.received_fps());
                 let v = t.view();
                 serde_json::json!({
@@ -126,6 +135,7 @@ impl App {
                     "latency_ms": v.latency_ms,
                     "age_ms": v.age_ms,
                     "dropped": v.dropped,
+                    "rect": rect,
                 })
             })
             .collect();
@@ -386,6 +396,7 @@ impl eframe::App for App {
                         self.focus = if self.focus == Some(i) { None } else { Some(i) };
                     }
                 }
+                self.tile_rects = rects;
             });
         // Keep the stats readout fresh even without new frames.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
