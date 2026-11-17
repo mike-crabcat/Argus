@@ -288,6 +288,14 @@ async fn serves_the_web_app_without_a_token() {
     );
 }
 
+#[tokio::test]
+async fn healthz_needs_no_token() {
+    let (addr, _s) = server().await;
+    let (status, body) = reqwest_get(&format!("http://{addr}/healthz"), None).await;
+    assert_eq!(status, 200);
+    assert!(body.starts_with("ok "), "{body}");
+}
+
 /// Minimal HTTP GET (status, body) so the test needs no HTTP client crate.
 async fn reqwest_get(url: &str, token: Option<&str>) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

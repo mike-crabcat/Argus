@@ -28,6 +28,9 @@ enum Command {
     /// Manage events (periods worth keeping at full resolution).
     #[command(subcommand)]
     Event(EventCommand),
+    /// Exit 0 if the server from this config answers /healthz (for Docker's
+    /// HEALTHCHECK; the image has no curl).
+    Healthcheck,
 }
 
 #[derive(Subcommand)]
@@ -65,6 +68,7 @@ async fn main() -> Result<()> {
     let cfg = Config::load(&args.config)?;
     match args.command.unwrap_or(Command::Run) {
         Command::Run => run(cfg).await,
+        Command::Healthcheck => healthcheck(&cfg).await,
         Command::Event(EventCommand::Add {
             camera,
             from,
@@ -129,6 +133,22 @@ async fn watch(cfg: &Config, seconds: u64) -> Result<()> {
     Ok(())
 }
 
+async fn healthcheck(cfg: &Config) -> Result<()> {
+    let h = cfg.http.as_ref().context("no [http] section to check")?;
+    let mut addr = h.listen;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?
+        .get(format!("http://{addr}/healthz"))
+        .send()
+        .await?;
+    anyhow::ensure!(resp.status().is_success(), "healthz: {}", resp.status());
+    Ok(())
+}
+
 async fn run(cfg: Config) -> Result<()> {
     std::fs::create_dir_all(&cfg.storage.root)
         .with_context(|| format!("creating {}", cfg.storage.root.display()))?;
@@ -178,7 +198,8 @@ async fn run(cfg: Config) -> Result<()> {
                 root: Arc::new(cfg.storage.root.clone()),
             }),
         };
-        info!(listen = %h.listen, auth = h.token.is_some(), "HTTP API and live view");
+        info!(listen = %h.listen, auth = h.token.is_some(), version = http::VERSION,
+          "HTTP API and live view");
         background.push(tokio::spawn(async move {
             if let Err(e) = http::serve(listener, state).await {
                 warn!("HTTP server stopped: {e}");
