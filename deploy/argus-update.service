@@ -1,0 +1,7 @@
+[Unit]
+Description=Pull and redeploy the Argus image if it changed
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/argus-deploy/argus-update.sh
