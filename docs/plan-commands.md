@@ -39,6 +39,14 @@ the code in `crates/argus-plan` and checked by its tests.
   background image and returns `{"id": "...", "width": W, "height": H}`.
   `GET /api/plan/assets/{id}` serves it.
 
+- `POST /api/plan/import` with `{"asset": "...", "level": 1}` and
+  `POST /api/plan/ask` with `{"text": "...", "level": 1}` have the agent
+  (if configured) draft a command batch. It gets this schema as its one
+  tool; Argus applies its batch to a copy of the plan and sends refusals
+  back for it to fix. The answer is `{"commands": [...], "summary": "...",
+  "warnings": [...], "run": {...}}`. Nothing is saved: send the commands
+  to `/api/plan/commands` to keep them.
+
 Reading needs any valid token, including a phone's. Changing the plan needs
 the main token.
 

@@ -18,6 +18,15 @@ pub struct Doc {
     pending: Vec<Command>,
     /// Commands sent and awaiting the server's answer.
     in_flight: Vec<Command>,
+    /// An agent's draft being reviewed: how things were before it.
+    draft: Option<DraftMark>,
+}
+
+#[derive(Clone, Debug)]
+struct DraftMark {
+    plan: Plan,
+    undo: usize,
+    pending: usize,
 }
 
 impl Doc {
@@ -29,6 +38,63 @@ impl Doc {
             redo: Vec::new(),
             pending: Vec::new(),
             in_flight: Vec::new(),
+            draft: None,
+        }
+    }
+
+    /// Applies an agent's batch as a draft: one undoable step, not saved
+    /// until accepted. Edits made meanwhile belong to the draft.
+    pub fn begin_draft(&mut self, commands: Vec<Command>) -> Result<(), PlanError> {
+        if self.draft.is_some() {
+            return Err(PlanError::Invalid("finish the current draft first".into()));
+        }
+        let mark = DraftMark {
+            plan: self.plan.clone(),
+            undo: self.undo.len(),
+            pending: self.pending.len(),
+        };
+        self.exec(Command::Batch { commands })?;
+        self.draft = Some(mark);
+        Ok(())
+    }
+
+    pub fn has_draft(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    /// Ids the draft added (to highlight them).
+    pub fn draft_ids(&self) -> Vec<Id> {
+        let Some(m) = &self.draft else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        for l in &self.plan.levels {
+            let all = l
+                .nodes
+                .iter()
+                .map(|e| e.id)
+                .chain(l.walls.iter().map(|e| e.id))
+                .chain(l.openings.iter().map(|e| e.id))
+                .chain(l.rooms.iter().map(|e| e.id))
+                .chain(l.dimensions.iter().map(|e| e.id))
+                .chain(l.cameras.iter().map(|e| e.id));
+            ids.extend(all.filter(|id| !m.plan.uses(*id)));
+        }
+        ids
+    }
+
+    /// Keeps the draft (and any tweaks): it saves like any edit.
+    pub fn accept_draft(&mut self) {
+        self.draft = None;
+    }
+
+    /// Drops the draft and everything done since it arrived.
+    pub fn discard_draft(&mut self) {
+        if let Some(m) = self.draft.take() {
+            self.plan = m.plan;
+            self.undo.truncate(m.undo);
+            self.pending.truncate(m.pending);
+            self.redo.clear();
         }
     }
 
@@ -92,7 +158,7 @@ impl Doc {
 
     /// The commands to send now (with the version they build on), if any.
     pub fn begin_save(&mut self) -> Option<(u64, Vec<Command>)> {
-        if self.saving() || self.pending.is_empty() {
+        if self.saving() || self.pending.is_empty() || self.draft.is_some() {
             return None;
         }
         self.in_flight = std::mem::take(&mut self.pending);
@@ -431,6 +497,45 @@ mod tests {
         d.undo();
         d.exec(room(lv, "D")).unwrap();
         assert!(!d.can_redo());
+    }
+
+    #[test]
+    fn drafts_accept_or_discard_as_one_step() {
+        let mut d = Doc::new(Versioned {
+            version: 0,
+            plan: Plan::default(),
+        });
+        let lv = d.plan.levels[0].id;
+        d.exec(room(lv, "Mine")).unwrap();
+        let (_, first) = d.begin_save().unwrap();
+        d.saved(1);
+        let house = argus_plan::fixture::demo_house_commands(lv, 1000);
+        d.begin_draft(house.clone()).unwrap();
+        assert!(d.has_draft() && d.dirty());
+        assert!(d.begin_save().is_none(), "drafts aren't saved");
+        assert!(d.draft_ids().len() > 50);
+        // A tweak during review, then discard: back to before the draft.
+        d.exec(room(lv, "Tweak")).unwrap();
+        d.discard_draft();
+        assert_eq!(d.plan.levels[0].rooms.len(), 1);
+        assert!(!d.dirty() && !d.can_redo());
+        // Accept: one undo step, then saved with the tweak.
+        d.begin_draft(house).unwrap();
+        d.exec(room(lv, "Tweak")).unwrap();
+        d.accept_draft();
+        let (_, cmds) = d.begin_save().unwrap();
+        assert_eq!(cmds.len(), 2, "the batch and the tweak");
+        let mut server = Plan::default();
+        server.apply_all(&first).unwrap();
+        server.apply_all(&cmds).unwrap();
+        assert_eq!(server, d.plan);
+        d.undo();
+        d.undo();
+        assert_eq!(
+            d.plan.levels[0].rooms.len(),
+            1,
+            "two undos remove tweak and draft"
+        );
     }
 
     #[test]

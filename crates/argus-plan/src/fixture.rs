@@ -21,18 +21,43 @@ fn wall_at(l: &Level, p: Point) -> (Id, f64) {
         .unwrap_or_else(|| panic!("no wall at {p:?}"))
 }
 
-pub fn demo_house() -> Plan {
-    let mut p = Plan::default();
-    let level = p.levels[0].id;
-    let wall = |p: &mut Plan, a: (f64, f64), b: (f64, f64), t: f64| {
-        p.apply(&Command::AddWall {
-            level,
-            id: None,
-            a: End::At(pt(a.0, a.1)),
-            b: End::At(pt(b.0, b.1)),
-            thickness: t,
-        })
-        .unwrap();
+/// Applies `cmd` with every new entity's id made explicit, and records it.
+fn rec(p: &mut Plan, out: &mut Vec<Command>, mut cmd: Command) {
+    let next = Some(Id(p.next_id));
+    match &mut cmd {
+        Command::AddWall { id, .. }
+        | Command::AddOpening { id, .. }
+        | Command::AddRoom { id, .. }
+        | Command::AddDimension { id, .. }
+        | Command::PlaceCamera { id, .. } => *id = id.or(next),
+        _ => {}
+    }
+    p.apply(&cmd).unwrap();
+    out.push(cmd);
+}
+
+/// The demo house as one command batch for an empty level `level`, with
+/// explicit ids from `first_id` up, so the same batch can be replayed (by
+/// a scripted model, say) on any plan whose next free id is at most
+/// `first_id`.
+pub fn demo_house_commands(level: Id, first_id: u64) -> Vec<Command> {
+    let mut p = Plan {
+        levels: vec![Level::new(level, "Ground")],
+        next_id: first_id,
+    };
+    let mut out: Vec<Command> = Vec::new();
+    let wall = |p: &mut Plan, out: &mut Vec<Command>, a: (f64, f64), b: (f64, f64), t: f64| {
+        rec(
+            p,
+            out,
+            Command::AddWall {
+                level,
+                id: None,
+                a: End::At(pt(a.0, a.1)),
+                b: End::At(pt(b.0, b.1)),
+                thickness: t,
+            },
+        );
     };
     // Outside: 16 x 11 m, the front (south) along y = 0.
     for (a, b) in [
@@ -41,11 +66,11 @@ pub fn demo_house() -> Plan {
         ((16000.0, 11000.0), (0.0, 11000.0)),
         ((0.0, 11000.0), (0.0, 0.0)),
     ] {
-        wall(&mut p, a, b, EXT);
+        wall(&mut p, &mut out, a, b, EXT);
     }
     // Garage (double), then the rooms.
-    wall(&mut p, (10000.0, 0.0), (10000.0, 6500.0), EXT);
-    wall(&mut p, (10000.0, 6500.0), (16000.0, 6500.0), EXT);
+    wall(&mut p, &mut out, (10000.0, 0.0), (10000.0, 6500.0), EXT);
+    wall(&mut p, &mut out, (10000.0, 6500.0), (16000.0, 6500.0), EXT);
     for (a, b) in [
         ((0.0, 4500.0), (10000.0, 4500.0)),
         ((4000.0, 0.0), (4000.0, 11000.0)),
@@ -54,7 +79,7 @@ pub fn demo_house() -> Plan {
         ((13000.0, 6500.0), (13000.0, 11000.0)),
         ((13000.0, 9000.0), (16000.0, 9000.0)),
     ] {
-        wall(&mut p, a, b, INT);
+        wall(&mut p, &mut out, a, b, INT);
     }
 
     let swing = |hinge, side| Some(Swing { hinge, side });
@@ -118,16 +143,19 @@ pub fn demo_house() -> Plan {
     ];
     for (at, kind, width, swing) in openings {
         let (wall, offset) = wall_at(&p.levels[0], at);
-        p.apply(&Command::AddOpening {
-            level,
-            id: None,
-            wall,
-            kind,
-            offset,
-            width,
-            swing,
-        })
-        .unwrap();
+        rec(
+            &mut p,
+            &mut out,
+            Command::AddOpening {
+                level,
+                id: None,
+                wall,
+                kind,
+                offset,
+                width,
+                swing,
+            },
+        );
     }
     for (name, x, y) in [
         ("Bedroom 1", 2000.0, 2250.0),
@@ -141,27 +169,33 @@ pub fn demo_house() -> Plan {
         ("Laundry", 14500.0, 7750.0),
         ("Bathroom", 14500.0, 10000.0),
     ] {
-        p.apply(&Command::AddRoom {
-            level,
-            id: None,
-            name: name.into(),
-            at: pt(x, y),
-            polygon: None,
-        })
-        .unwrap();
+        rec(
+            &mut p,
+            &mut out,
+            Command::AddRoom {
+                level,
+                id: None,
+                name: name.into(),
+                at: pt(x, y),
+                polygon: None,
+            },
+        );
     }
     for (a, b, offset) in [
         (pt(0.0, 0.0), pt(16000.0, 0.0), -1500.0),
         (pt(16000.0, 0.0), pt(16000.0, 11000.0), -1500.0),
     ] {
-        p.apply(&Command::AddDimension {
-            level,
-            id: None,
-            a,
-            b,
-            offset,
-        })
-        .unwrap();
+        rec(
+            &mut p,
+            &mut out,
+            Command::AddDimension {
+                level,
+                id: None,
+                a,
+                b,
+                offset,
+            },
+        );
     }
     // camera, x, y, heading, fov, range, mount height
     for (camera, x, y, heading, fov, range, mount) in [
@@ -171,18 +205,28 @@ pub fn demo_house() -> Plan {
         ("laundry", 16200.0, 10800.0, 270.0, 80.0, 12000.0, 2400.0),
         ("back", 1000.0, 11200.0, 60.0, 110.0, 14000.0, 2700.0),
     ] {
-        p.apply(&Command::PlaceCamera {
-            level,
-            id: None,
-            camera: camera.into(),
-            at: pt(x, y),
-            heading,
-            fov,
-            range,
-            mount_height: mount,
-        })
-        .unwrap();
+        rec(
+            &mut p,
+            &mut out,
+            Command::PlaceCamera {
+                level,
+                id: None,
+                camera: camera.into(),
+                at: pt(x, y),
+                heading,
+                fov,
+                range,
+                mount_height: mount,
+            },
+        );
     }
+    out
+}
+
+pub fn demo_house() -> Plan {
+    let mut p = Plan::default();
+    let cmds = demo_house_commands(p.levels[0].id, p.next_id);
+    p.apply_all(&cmds).unwrap();
     p
 }
 

@@ -20,6 +20,9 @@
 //! * `GET /api/plan`, `PUT /api/plan`, `POST /api/plan/commands`,
 //!   `POST /api/plan/assets`, `GET /api/plan/assets/{id}`: the floor plan
 //!   (see [`crate::plan`] and docs/plan-commands.md).
+//! * `POST /api/plan/import` (`{asset, level}`), `POST /api/plan/ask`
+//!   (`{text, level}`): the agent drafts plan commands (main token only;
+//!   nothing is saved until the editor sends them).
 //! * `GET /api/agent/status`: whether a model is set up; spending for the
 //!   main token.
 //! * Anything else: static files from `[http] web_root` (the browser app),
@@ -155,6 +158,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/plan/assets/{id}", get(crate::plan::get_asset))
         .route("/api/agent/status", get(crate::agent::status))
+        .route(
+            "/api/plan/import",
+            axum::routing::post(crate::plan_agent::import),
+        )
+        .route("/api/plan/ask", axum::routing::post(crate::plan_agent::ask))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     api.route("/healthz", get(healthz))
         .fallback(static_file)
