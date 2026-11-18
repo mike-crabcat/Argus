@@ -352,13 +352,45 @@ pub async fn ask(
          update_entity, set_room_name and small additions over rebuilding. Use level id {}.",
         req.level.0
     );
-    let user = vec![Part::Text {
-        text: format!(
-            "{}\n\nThe change: {}",
-            level_summary(&base, req.level),
-            req.text.trim()
-        ),
-    }];
+    let mut text = level_summary(&base, req.level);
+    // The level's background (a scanned plan, a sketch) goes along, with
+    // where its pixels are on the plan, so "draw the outside walls" can be
+    // done from it.
+    let mut image = None;
+    if let Some(bg) = base.level(req.level).and_then(|l| l.background.clone())
+        && let Some((bytes, media_type)) = store.asset(&bg.asset)
+        && let Some((_, (w, h))) = crate::plan::image_info(&bytes)
+    {
+        let (wm, hm) = (
+            w as f64 * bg.mm_per_px / 1000.0,
+            h as f64 * bg.mm_per_px / 1000.0,
+        );
+        text.push_str(&format!(
+            "\n\nThe level's background image is attached ({w} x {h} pixels). Image pixel \
+             (px, py) is plan point (x, y) = ({ox:.0} + u*cos(r) - v*sin(r), {oy:.0} + \
+             u*sin(r) + v*cos(r)) with u = px * {s}, v = -py * {s} and r = {rot} degrees: \
+             the image covers {wm:.1} m by {hm:.1} m on the plan.",
+            ox = bg.offset.x,
+            oy = bg.offset.y,
+            s = bg.mm_per_px,
+            rot = bg.rotation,
+        ));
+        if !(2.0..=500.0).contains(&wm.max(hm)) {
+            text.push_str(
+                " That size looks wrong for a building. Estimate the real scale from the \
+                 drawing (dimensions written on it, or typical door and room sizes) and put a \
+                 set_background command first with the corrected mm_per_px and offset (keep \
+                 the asset, rotation and opacity); place everything else to match it.",
+            );
+        }
+        image = Some(Part::Image {
+            media_type: media_type.to_owned(),
+            data: bytes,
+        });
+    }
+    text.push_str(&format!("\n\nThe change: {}", req.text.trim()));
+    let mut user = vec![Part::Text { text }];
+    user.extend(image);
     draft(&st, "plan-ask", system, user, base, req.level, None).await
 }
 
