@@ -103,13 +103,20 @@ summarize = true                     # let the agent summarise this camera's eve
 # summaries = true               # summarise events in the background
 # summary_gap_seconds = 60       # at most one per camera per minute (merged)
 
-# Optional: Argus's own object detection (in progress). For now this
-# decodes each camera's sub stream and logs how long that takes; the
-# detector itself comes next.
+# Optional: Argus's own object detection (in progress). Each camera's sub
+# stream is decoded on the CPU and 5 pictures a second go to the model on
+# the GPU; for now what it finds is only logged. The model is D-FINE-S
+# (Apache-2.0): download onnx/model.onnx from
+# https://huggingface.co/onnx-community/dfine_s_coco-ONNX (41 MB). The
+# Docker image has CUDA; give the container the GPU (see docs/deploy.md).
 # [detect]
+# model = "/var/lib/argus/models/dfine_s_coco.onnx"
+# device = "cuda"                # "cuda", "cuda:N" or "cpu"
+# threshold = 0.5                # drop detections less sure than this
 # fps = 5                        # pictures a second to look at, per camera
 # stream = "sub"                 # which stream to decode (H.264)
 # cameras = []                   # empty: all
+# log_seconds = 600              # how often to log what it found
 
 # Optional: alerts and the daily brief. Notifications go to browsers that
 # enable them in the viewer (Alerts, then "Enable notifications"; on an

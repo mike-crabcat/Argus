@@ -37,6 +37,41 @@ pub struct DetectConfig {
     /// Cameras to run on; empty for all.
     #[serde(default)]
     pub cameras: Vec<String>,
+    /// The detection model (ONNX). Without it, streams are only decoded.
+    pub model: Option<PathBuf>,
+    /// "cuda" (the default; GPU 0), "cuda:N" or "cpu".
+    #[serde(default = "default_detect_device")]
+    pub device: String,
+    /// Detections less sure than this are dropped (0 to 1).
+    #[serde(default = "default_detect_threshold")]
+    pub threshold: f32,
+    /// How often to log what decoding and the model did (seconds).
+    #[serde(default = "default_detect_log")]
+    pub log_seconds: u64,
+}
+
+impl DetectConfig {
+    pub fn device(&self) -> Result<argus_detect::model::Device> {
+        use argus_detect::model::Device;
+        match self.device.as_str() {
+            "cpu" => Ok(Device::Cpu),
+            "cuda" => Ok(Device::Cuda(0)),
+            d => match d.strip_prefix("cuda:").and_then(|n| n.parse().ok()) {
+                Some(n) => Ok(Device::Cuda(n)),
+                None => bail!("[detect] device {d:?} must be \"cuda\", \"cuda:N\" or \"cpu\""),
+            },
+        }
+    }
+}
+
+fn default_detect_device() -> String {
+    "cuda".into()
+}
+fn default_detect_log() -> u64 {
+    600
+}
+fn default_detect_threshold() -> f32 {
+    0.5
 }
 
 fn default_detect_fps() -> f64 {

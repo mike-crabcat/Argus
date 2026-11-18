@@ -11,7 +11,13 @@ rust-version.workspace = true
 argus-media.workspace = true
 bytes.workspace = true
 openh264 = "0.9"
+# ONNX Runtime, with its prebuilt library downloaded at build time.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-rustls", "api-24"] }
 thiserror.workspace = true
+
+[features]
+# The CUDA execution provider (needs CUDA 12 and cuDNN 9 at run time).
+cuda = ["ort/cuda"]
 
 [dev-dependencies]
 anyhow.workspace = true

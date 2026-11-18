@@ -69,3 +69,19 @@ docker compose --env-file .env up -d
 
 To run an image built here instead (`docker build -t argus:local .`), set
 `ARGUS_IMAGE=argus:local` in `.env`; the timer leaves local images alone.
+
+## Detection on the GPU
+
+The image carries CUDA 13 and cuDNN 9 for `[detect]` (see
+[`design/detection.md`](design/detection.md)). The host needs the NVIDIA
+driver (580 or newer) and the NVIDIA container toolkit, and the container
+must ask for the GPU. Add this to the service in `compose.yaml`:
+
+```yaml
+    gpus: all
+```
+
+Put the model somewhere under the data directory, which is already
+mounted (for example `${ARGUS_DATA}/models/dfine_s_coco.onnx`), and point
+`[detect] model` at it. Without the GPU, `device = "cpu"` works too, at
+about 130 ms a picture instead of 12.

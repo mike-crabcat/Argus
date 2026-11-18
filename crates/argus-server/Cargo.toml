@@ -11,6 +11,10 @@ rust-version.workspace = true
 name = "argus"
 path = "src/main.rs"
 
+[features]
+# Run detection on an NVIDIA GPU (needs CUDA 13 and cuDNN 9 at run time).
+cuda = ["argus-detect/cuda"]
+
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.22"

@@ -15,13 +15,18 @@ landing one PR at a time.
    five cameras: 0.5 to 1.1 ms a frame, about 1 to 2% of one core per
    camera. NVDEC would save little at this size; it's worth revisiting only
    for main streams.
-2. **Detector** (next). An ONNX model run with `ort` on the CUDA execution
-   provider (TensorRT later, as an option): D-FINE-S (Apache-2.0 code and
-   weights), with RT-DETRv2-S or YOLOX-S (both Apache-2.0) as fallbacks.
-   No AGPL models. Weights are downloaded by URL and checked against a
-   SHA-256, never committed. COCO classes map to Argus's labels: person;
-   car, truck, bus, motorcycle, bicycle as vehicle; dog, cat, bird as
-   animal.
+2. **Detector** (`argus-detect::model`, done; findings only logged so far).
+   An ONNX model run with `ort` on the CUDA execution provider (TensorRT
+   later, as an option): D-FINE-S (Apache-2.0 code and weights), with RT-
+   DETRv2-S or YOLOX-S (both Apache-2.0) as fallbacks. No AGPL models. The
+   model file is configured by path and never committed: `onnx/model.onnx`
+   from `onnx-community/dfine_s_coco-ONNX`. Pictures are resized to 640x640
+   on each camera's thread, then the model thread takes whatever has
+   arrived within 60 ms as one batch. ONNX Runtime comes from the `ort`
+   crate's prebuilt binaries; the Docker image adds CUDA 13 and cuDNN 9
+   from NVIDIA's redistributable wheels. COCO classes map to Argus's
+   labels: person; car, truck, bus, motorcycle, bicycle as vehicle; dog,
+   cat, bird as animal.
 3. **Tracking.** An IoU/ByteTrack-style tracker links boxes into tracks; a
    track seen for three or more pictures becomes an event in the existing
    event table, so stills, summaries, alerts and search work unchanged.
@@ -39,10 +44,13 @@ two can be compared for a few days before switching.
 
 ## Load
 
-At 5 pictures a second from five cameras: 25 inferences a second, batched
-per tick. D-FINE-S takes about 6-8 ms a picture on an RTX 3060 (FP32,
-CUDA), so the GPU is busy 15-20% of the time, less with TensorRT FP16;
-about 1 GB of VRAM. CPU: well under one core in all, mostly decoding.
+Measured live on five cameras at 5 pictures a second each, with Frigate
+still running on the same RTX 3060: the GPU 17-23% busy with batching
+(31-55% without), about 1.1 GB of VRAM, and about 0.7 of one CPU core
+for decoding, resizing and the model's host side. On its own, D-FINE-S
+takes 12 ms a picture in batches (15 ms one at a time; 130 ms on the
+CPU). An FP16 export was no faster under CUDA; TensorRT FP16 is the
+next step if the GPU gets busy.
 
 ## Configuration
 

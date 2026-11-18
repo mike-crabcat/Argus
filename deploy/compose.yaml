@@ -13,6 +13,8 @@ services:
     volumes:
       - ${ARGUS_CONFIG:?set ARGUS_CONFIG}:/etc/argus/argus.toml:ro
       - ${ARGUS_DATA:?set ARGUS_DATA}:${ARGUS_DATA}
+    # For [detect] on an NVIDIA GPU (needs the NVIDIA container toolkit):
+    # gpus: all
     stop_signal: SIGINT
     stop_grace_period: 30s
     logging:
