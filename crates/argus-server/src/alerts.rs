@@ -395,6 +395,8 @@ pub struct Engine {
     pub last_id: i64,
     /// Events waiting for stills before their check: (rule, event, due).
     pub pending: Vec<(String, EventRow, i64)>,
+    /// Cameras' `context` lines from the config.
+    pub contexts: std::collections::HashMap<String, String>,
 }
 
 /// Stills are taken up to 5 s in.
@@ -419,6 +421,7 @@ impl Engine {
             tz,
             last_id,
             pending: Vec::new(),
+            contexts: Default::default(),
         }
     }
 
@@ -466,11 +469,18 @@ impl Engine {
             .as_ref()
             .and_then(|h| h.agent.as_ref().ok())
             .ok_or(AgentError::NotConfigured)?;
+        let about = match self.contexts.get(&e.camera) {
+            Some(c) => format!(" (it looks at: {c})"),
+            None => String::new(),
+        };
         let mut user = vec![Part::Text {
-            text: format!("Camera {} saw: {}. Question: {question}", e.camera, e.label),
+            text: format!(
+                "Camera {}{about} saw: {}. Question: {question}",
+                e.camera, e.label
+            ),
         }];
         for n in self.stills.list(e.id).into_iter().take(3) {
-            if let Some(b) = self.stills.read(e.id, n) {
+            if let Some(b) = self.stills.for_model(e.id, n).await {
                 user.push(Part::Image {
                     media_type: "image/jpeg".into(),
                     data: b,
