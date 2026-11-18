@@ -203,6 +203,26 @@ async fn run(cfg: Config) -> Result<()> {
                 }
             }));
         }
+        // Notifications, alert rules and the daily brief.
+        let default_alerts = argus_server::config::AlertsConfig::default();
+        let acfg = cfg.alerts.as_ref().unwrap_or(&default_alerts);
+        let tz: chrono_tz::Tz = acfg
+            .timezone
+            .parse()
+            .map_err(|e| anyhow::anyhow!("[alerts] timezone {:?}: {e}", acfg.timezone))?;
+        let alerts = Arc::new(argus_server::alerts_api::AlertsState {
+            rules: Arc::new(argus_server::alerts::RuleStore::open(&cfg.storage.root)?),
+            notifier: Arc::new(argus_server::push::Notifier::new(
+                &cfg.storage.root,
+                acfg.ntfy.as_ref(),
+                h.public_url.clone(),
+                acfg.contact.clone(),
+            )?),
+            briefs: Arc::new(argus_server::brief::BriefStore::open(&cfg.storage.root)?),
+            tz,
+            brief_time: acfg.brief_time.clone(),
+            brief_enabled: acfg.brief,
+        });
         let state = http::AppState {
             live: live.clone(),
             token: h.token.as_deref().map(Arc::from),
@@ -223,6 +243,7 @@ async fn run(cfg: Config) -> Result<()> {
                 .agent
                 .as_ref()
                 .map(|a| Arc::new(argus_server::agent::AgentHandle::new(a, &cfg.storage.root))),
+            alerts: Some(alerts.clone()),
             public_url: h
                 .public_url
                 .as_deref()
@@ -249,6 +270,26 @@ async fn run(cfg: Config) -> Result<()> {
             };
             info!(gap_s = ac.summary_gap_seconds, "summarising events");
             background.push(tokio::spawn(worker.run()));
+        }
+        let engine = argus_server::alerts::Engine::new(
+            alerts.rules.clone(),
+            index.clone(),
+            alerts.notifier.clone(),
+            state.agent.clone(),
+            argus_server::stills::StillStore::new(&cfg.storage.root),
+            tz,
+        );
+        background.push(tokio::spawn(engine.run()));
+        if alerts.brief_enabled {
+            info!(at = %alerts.brief_time, timezone = %tz.name(), "daily brief");
+            background.push(tokio::spawn(argus_server::brief::schedule(
+                state.agent.clone(),
+                index.clone(),
+                alerts.briefs.clone(),
+                alerts.notifier.clone(),
+                alerts.brief_time.clone(),
+                tz,
+            )));
         }
         info!(listen = %h.listen, auth = h.token.is_some(), version = http::VERSION,
           "HTTP API and live view");

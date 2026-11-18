@@ -83,6 +83,7 @@ async fn server_with(
         public_url: None,
         plan: None,
         agent: None,
+        alerts: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();

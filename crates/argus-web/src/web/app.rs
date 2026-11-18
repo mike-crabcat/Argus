@@ -10,6 +10,7 @@ use eframe::egui::{
 };
 use eframe::egui_wgpu::RenderState;
 
+use super::alerts::{AlertAction, Alerts};
 use super::phones::Phones;
 use super::plan::{MapAction, PlanView};
 use super::replay::Replay;
@@ -76,6 +77,12 @@ pub struct App {
     map: Option<PlanView>,
     /// Event search: the box and its results panel.
     search: Search,
+    /// Notifications, rules and the brief.
+    alerts: Alerts,
+    /// Opened from a notification: replay this camera from this time.
+    open_at: Option<(f64, String)>,
+    /// Top bar buttons drawn last frame, for scripts.
+    bar_buttons: Vec<(String, [f32; 4])>,
     /// Phones added by QR code (admin only).
     phones: Phones,
     /// Whether `phones` knows our role for the current sign-in.
@@ -96,6 +103,8 @@ impl App {
             }
             None => stored_token(),
         };
+        // Notification links: ?t=MS&camera=NAME (replay) or ?brief=1.
+        let (open_at, show_brief) = link_params();
         let cameras = Rc::new(RefCell::new(Cameras::Loading));
         fetch_cameras(&cameras, token.clone(), &cc.egui_ctx);
         let backend = cc
@@ -123,6 +132,9 @@ impl App {
             timeline_rect_cache: None,
             map: None,
             search: Search::default(),
+            alerts: Alerts::opened(show_brief),
+            open_at,
+            bar_buttons: Vec::new(),
             phones: Phones::default(),
             phones_loaded: false,
         }
@@ -413,6 +425,8 @@ impl App {
             },
             "plan": self.map.as_ref().map(|m| m.stats()),
             "search": self.search.stats(),
+            "alerts": self.alerts.stats(),
+            "bar": self.bar_buttons,
             "auth": match &*self.cameras.borrow() {
                 Cameras::NeedToken(_) => "token needed",
                 Cameras::Loaded(_) => "ok",
@@ -450,19 +464,26 @@ impl App {
         let p = ui.painter().clone();
         p.hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, LINE));
         let cy = bar.center().y;
-        let title = p.text(
-            pos2(bar.left() + 16.0, cy),
-            Align2::LEFT_CENTER,
-            "Argus",
-            theme::semibold(17.0),
-            TEXT,
-        );
+        // Phones: the title, the Stats pill and some width give way.
+        let narrow = bar.width() < 480.0;
+        self.bar_buttons.clear();
+        let title = if narrow {
+            Rect::from_min_size(pos2(bar.left() + 8.0, cy), vec2(0.0, 0.0))
+        } else {
+            p.text(
+                pos2(bar.left() + 16.0, cy),
+                Align2::LEFT_CENTER,
+                "Argus",
+                theme::semibold(17.0),
+                TEXT,
+            )
+        };
 
         // Right side, right to left: Live | Replay switch, Stats, backend.
         let pill = |x_right: f32, w: f32| {
             Rect::from_center_size(pos2(x_right - w / 2.0, cy), vec2(w, 26.0))
         };
-        let seg = pill(bar.right() - 16.0, 216.0);
+        let seg = pill(bar.right() - 12.0, if narrow { 186.0 } else { 216.0 });
         let (live_r, rest) = seg.split_left_right_at_fraction(1.0 / 3.0);
         let (replay_r, map_r) = rest.split_left_right_at_fraction(0.5);
         let in_replay = self.replay.is_some();
@@ -536,36 +557,51 @@ impl App {
             self.start_map(ui.ctx(), rs);
         }
 
-        let stats_r = pill(seg.left() - 8.0, 64.0);
-        let resp = ui.interact(stats_r, id.with("stats"), Sense::click());
-        if resp.clicked() {
-            self.show_stats = !self.show_stats;
+        for (k, r) in [("live", live_r), ("replay", replay_r), ("map", map_r)] {
+            self.bar_buttons
+                .push((k.into(), [r.min.x, r.min.y, r.width(), r.height()]));
         }
-        p.rect_filled(stats_r, CornerRadius::same(theme::PILL_RADIUS), SURFACE);
-        let border = if self.show_stats || resp.hovered() {
-            ACCENT
+        let stats_r = if narrow {
+            Rect::from_min_size(pos2(seg.left(), cy), vec2(0.0, 0.0))
         } else {
-            LINE
+            let stats_r = pill(seg.left() - 8.0, 64.0);
+            {
+                let resp = ui.interact(stats_r, id.with("stats"), Sense::click());
+                if resp.clicked() {
+                    self.show_stats = !self.show_stats;
+                }
+                p.rect_filled(stats_r, CornerRadius::same(theme::PILL_RADIUS), SURFACE);
+                let border = if self.show_stats || resp.hovered() {
+                    ACCENT
+                } else {
+                    LINE
+                };
+                p.rect_stroke(
+                    stats_r,
+                    CornerRadius::same(theme::PILL_RADIUS),
+                    Stroke::new(1.0, border),
+                    StrokeKind::Inside,
+                );
+                p.text(
+                    stats_r.center(),
+                    Align2::CENTER_CENTER,
+                    "Stats",
+                    theme::regular(12.5),
+                    if self.show_stats { TEXT } else { TEXT_2 },
+                );
+            }
+            stats_r
         };
-        p.rect_stroke(
-            stats_r,
-            CornerRadius::same(theme::PILL_RADIUS),
-            Stroke::new(1.0, border),
-            StrokeKind::Inside,
-        );
-        p.text(
-            stats_r.center(),
-            Align2::CENTER_CENTER,
-            "Stats",
-            theme::regular(12.5),
-            if self.show_stats { TEXT } else { TEXT_2 },
-        );
         let mut left = stats_r.left();
         let loaded = matches!(*self.cameras.borrow(), Cameras::Loaded(_));
         let wide = bar.width() >= 900.0;
         // Narrow screens: a Search pill opens the search panel.
         if loaded && !wide {
-            let sr = pill(left - 8.0, 66.0);
+            let sr = pill(left - 8.0, 62.0);
+            self.bar_buttons.push((
+                "search".into(),
+                [sr.min.x, sr.min.y, sr.width(), sr.height()],
+            ));
             let resp = ui.interact(sr, id.with("search"), Sense::click());
             if resp.clicked() {
                 self.search.show();
@@ -593,9 +629,60 @@ impl App {
             );
             left = sr.left();
         }
+        // Alerts: notifications, rules and the daily brief.
+        if loaded {
+            let ar = pill(left - 8.0, 60.0);
+            self.bar_buttons.push((
+                "alerts".into(),
+                [ar.min.x, ar.min.y, ar.width(), ar.height()],
+            ));
+            let resp = ui.interact(ar, id.with("alerts"), Sense::click());
+            if resp.clicked() {
+                if self.alerts.open {
+                    self.alerts.open = false;
+                } else {
+                    self.search.open = false;
+                    self.alerts.show(self.token.clone(), ui.ctx());
+                }
+            }
+            p.rect_filled(ar, CornerRadius::same(theme::PILL_RADIUS), SURFACE);
+            p.rect_stroke(
+                ar,
+                CornerRadius::same(theme::PILL_RADIUS),
+                Stroke::new(
+                    1.0,
+                    if resp.hovered() || self.alerts.open {
+                        ACCENT
+                    } else {
+                        LINE
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            p.text(
+                ar.center(),
+                Align2::CENTER_CENTER,
+                "Alerts",
+                theme::regular(12.5),
+                TEXT_2,
+            );
+            left = ar.left();
+        }
         // Phones (admin only): add a phone by QR code, or revoke one.
-        if self.phones.is_admin() && matches!(*self.cameras.borrow(), Cameras::Loaded(_)) {
+        if self.phones.is_admin()
+            && matches!(*self.cameras.borrow(), Cameras::Loaded(_))
+            && left - 88.0 > title.right() + 8.0
+        {
             let phones_r = pill(left - 8.0, 72.0);
+            self.bar_buttons.push((
+                "phones".into(),
+                [
+                    phones_r.min.x,
+                    phones_r.min.y,
+                    phones_r.width(),
+                    phones_r.height(),
+                ],
+            ));
             let resp = ui.interact(phones_r, id.with("phones"), Sense::click());
             if resp.clicked() {
                 self.phones.show(self.token.clone(), ui.ctx());
@@ -995,6 +1082,39 @@ fn fetch_cameras(cameras: &Rc<RefCell<Cameras>>, token: Option<String>, ctx: &eg
     });
 }
 
+/// `?t=MS&camera=NAME` (replay an event) and `?brief=1` from a
+/// notification's link; taken out of the address bar.
+fn link_params() -> (Option<(f64, String)>, bool) {
+    let Some(w) = web_sys::window() else {
+        return (None, false);
+    };
+    let Ok(search) = w.location().search() else {
+        return (None, false);
+    };
+    let Ok(q) = web_sys::UrlSearchParams::new_with_str(&search) else {
+        return (None, false);
+    };
+    let at = q
+        .get("t")
+        .and_then(|t| t.parse::<f64>().ok())
+        .zip(q.get("camera"));
+    let brief = q.get("brief").is_some();
+    if at.is_some() || brief {
+        let mut rest = search.clone();
+        for k in ["t", "camera", "brief"] {
+            rest = crate::without_param(&rest, k);
+        }
+        if let (Ok(h), Ok(path)) = (w.history(), w.location().pathname()) {
+            let _ = h.replace_state_with_url(
+                &wasm_bindgen::JsValue::NULL,
+                "",
+                Some(&format!("{path}{rest}")),
+            );
+        }
+    }
+    (at, brief)
+}
+
 /// ("HH:MM:SS", "YYYY-MM-DD") in the viewer's local time zone.
 fn local_time(ms: f64) -> (String, String) {
     let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms));
@@ -1147,6 +1267,43 @@ impl eframe::App for App {
         self.phones
             .ui(ctx, self.token.clone(), now_us() as f64 / 1000.0);
         // Search results, over the right of everything below the bar.
+        // Opened from a notification: replay that event once cameras are in.
+        if let Some((t, camera)) = self.open_at.clone()
+            && matches!(*self.cameras.borrow(), Cameras::Loaded(_))
+        {
+            self.open_at = None;
+            let names = self.camera_names();
+            self.start_replay(ctx, &rs, t - 3000.0);
+            self.set_focus(names.iter().position(|n| *n == camera));
+        }
+        if self.alerts.open {
+            if self.search.open {
+                self.search.open = false;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.alerts.open = false;
+            }
+            let c = ctx.content_rect();
+            let w = c.width().min(480.0);
+            let panel = Rect::from_min_max(pos2(c.right() - w, c.top() + 44.0), c.max);
+            let token = self.token.clone();
+            let admin = self.phones.is_admin();
+            let action = egui::Area::new(egui::Id::unique("argus-alerts"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(panel.min)
+                .show(ctx, |ui| {
+                    ui.set_min_size(panel.size());
+                    self.alerts.ui(ui, panel, token, admin)
+                })
+                .inner;
+            if let Some(AlertAction::Replay { camera, t_ms }) = action {
+                let names = self.camera_names();
+                self.map = None;
+                self.alerts.open = false;
+                self.start_replay(ctx, &rs, t_ms);
+                self.set_focus(names.iter().position(|n| *n == camera));
+            }
+        }
         if self.search.open {
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.search.open = false;

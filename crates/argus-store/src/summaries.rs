@@ -246,6 +246,24 @@ impl Index {
         Ok(out)
     }
 
+    /// Events with an id above `after`, oldest first (for watchers).
+    pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventRow>> {
+        let mut st = self
+            .conn
+            .prepare_cached(&format!("{SELECT} WHERE e.id > ?1 ORDER BY e.id LIMIT ?2"))?;
+        let rows = st
+            .query_map(params![after, limit as i64], row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The highest event id so far (0 if none).
+    pub fn last_event_id(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM event", [], |r| r.get(0))?)
+    }
+
     /// The oldest recording still on local disk for this camera, ms.
     pub fn oldest_local_ms(&self, camera: &str) -> Result<Option<i64>> {
         Ok(self.conn.query_row(

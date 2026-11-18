@@ -18,6 +18,48 @@ pub struct Config {
     pub cameras: Vec<Camera>,
     /// A model for agent features (plan import...). Off without it.
     pub agent: Option<argus_agent::config::AgentConfig>,
+    /// Notifications, alert rules and the daily brief.
+    pub alerts: Option<AlertsConfig>,
+}
+
+/// `[alerts]`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertsConfig {
+    /// For rule times and the brief, e.g. "Australia/Perth".
+    #[serde(default = "default_tz")]
+    pub timezone: String,
+    /// The daily brief's local time, "HH:MM".
+    #[serde(default = "default_brief_time")]
+    pub brief_time: String,
+    #[serde(default = "default_true")]
+    pub brief: bool,
+    /// A contact for push services (a URL or mailto:), sent with pushes.
+    pub contact: Option<String>,
+    /// Also send alerts to an ntfy topic.
+    pub ntfy: Option<crate::push::NtfyConfig>,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        AlertsConfig {
+            timezone: default_tz(),
+            brief_time: default_brief_time(),
+            brief: true,
+            contact: None,
+            ntfy: None,
+        }
+    }
+}
+
+fn default_tz() -> String {
+    "Australia/Perth".into()
+}
+fn default_brief_time() -> String {
+    "07:00".into()
+}
+fn default_true() -> bool {
+    true
 }
 
 /// An S3 bucket, on AWS or any S3-compatible store (MinIO, Backblaze B2,

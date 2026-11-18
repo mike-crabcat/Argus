@@ -153,3 +153,23 @@ can also read the question first ("anyone at the back gate last night").
 The API is `GET /api/events/search?q=...`, and stills are served at
 `/api/media/events/{id}/{n}.jpg`.
 
+### Alerts, notifications and the daily brief
+
+The **Alerts** button in the top bar sets up notifications on this device
+(Web Push; on an iPhone, add Argus to the Home Screen first) and holds the
+alert rules and the daily brief. Write a rule in plain English ("a person
+at the front door after 10pm"); with an `[agent]`, the model turns it into
+a filter (cameras, detections, a local time window, days, and optionally a
+question to ask of the event's stills) that you can see and edit. New
+events are matched against the filter; the model is only asked the rule's
+question, under the spending cap. Each rule fires at most once per
+cooldown; a notification opens the viewer at that event's replay. "Test
+on last 24 h" shows when a rule would have fired. Only the main token can
+change rules. Alerts can also go to an ntfy topic (`[alerts.ntfy]`).
+
+Every morning (07:00 Australia/Perth by default) the model writes a short
+brief of the last 24 hours from the event summaries, notable events first;
+it is shown under Alerts and sent as a notification. Without a model it is
+skipped. Push keys (VAPID) are made on first start in the storage root
+(`vapid.key`, chmod 600).
+
