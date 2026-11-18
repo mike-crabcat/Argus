@@ -72,6 +72,9 @@ streams.main = "http://192.168.1.21/flv?port=1935&app=bcs&stream=channel0_main.b
 streams.sub = "http://192.168.1.21/flv?port=1935&app=bcs&stream=channel0_sub.bcs&user=admin&password=password"
 # Keep this camera's full resolution in S3 all the time.
 upload.main = "always"
+# Optional: what the camera looks at, in a sentence, for event summaries
+# and alert checks (until the floor plan says it, or to add to it).
+context = "the front porch and the path out to the street"
 
 [camera.events]
 # source = "reolink"                 # or "none"
@@ -83,6 +86,7 @@ poll_ms = 1000
 hold_ms = 5000                       # end an event 5 s after last detection
 stills = true                        # snapshots at +0, +2 and +5 s (Snap API)
 summarize = true                     # let the agent summarise this camera's events
+# summary_gap_seconds = 600          # this camera's own gap (default: [agent]'s)
 
 # Optional: a model for agent features (importing a floor plan from a
 # sketch, "ask the agent to change the plan"). Any OpenAI-compatible
@@ -102,6 +106,8 @@ summarize = true                     # let the agent summarise this camera's eve
 # max_steps = 6
 # summaries = true               # summarise events in the background
 # summary_gap_seconds = 60       # at most one per camera per minute (merged)
+# still_max_edge = 1280          # shrink stills to this many px for the model
+                                 # (0: full size); the saved stills stay full size
 
 # Optional: alerts and the daily brief. Notifications go to browsers that
 # enable them in the viewer (Alerts, then "Enable notifications"; on an
