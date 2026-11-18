@@ -17,16 +17,16 @@ landing one PR at a time.
    for main streams.
 2. **Detector** (`argus-detect::model`, done; findings only logged so far).
    An ONNX model run with `ort` on the CUDA execution provider (TensorRT
-   later, as an option): D-FINE-S (Apache-2.0 code and weights), with RT-
-   DETRv2-S or YOLOX-S (both Apache-2.0) as fallbacks. No AGPL models. The
-   model file is configured by path and never committed: `onnx/model.onnx`
-   from `onnx-community/dfine_s_coco-ONNX`. Pictures are resized to 640x640
-   on each camera's thread, then the model thread takes whatever has
-   arrived within 60 ms as one batch. ONNX Runtime comes from the `ort`
-   crate's prebuilt binaries; the Docker image adds CUDA 13 and cuDNN 9
-   from NVIDIA's redistributable wheels. COCO classes map to Argus's
-   labels: person; car, truck, bus, motorcycle, bicycle as vehicle; dog,
-   cat, bird as animal.
+   later, as an option): D-FINE-S (Apache-2.0 code and weights), with
+   RT-DETRv2-S or YOLOX-S (both Apache-2.0) as fallbacks. No AGPL models.
+   The model file is configured by path and never committed:
+   `onnx/model.onnx` from `onnx-community/dfine_s_coco-ONNX`. Pictures are
+   resized to 640x640 on each camera's thread, then the model thread takes
+   whatever has arrived within 60 ms as one batch. ONNX Runtime comes from
+   the `ort` crate's prebuilt binaries; the Docker image adds CUDA 13 and
+   cuDNN 9 from NVIDIA's redistributable wheels. COCO classes map to
+   Argus's labels: person; car, truck, bus, motorcycle, bicycle as vehicle;
+   dog, cat, bird as animal.
 3. **Tracking.** An IoU/ByteTrack-style tracker links boxes into tracks; a
    track seen for three or more pictures becomes an event in the existing
    event table, so stills, summaries, alerts and search work unchanged.
