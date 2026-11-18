@@ -1236,6 +1236,9 @@ impl PlanView {
             if r.right() > canvas.right() - 4.0 {
                 r = r.translate(vec2(-(r.width() + 28.0), 0.0));
             }
+            if r.bottom() > canvas.bottom() - 4.0 {
+                r = r.translate(vec2(0.0, -(r.height() + 24.0)));
+            }
             p.rect_filled(r, CornerRadius::same(6), SURFACE);
             p.rect_stroke(
                 r,

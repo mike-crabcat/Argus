@@ -306,7 +306,12 @@ impl Search {
                         }
                         let x = thumb.right() + 12.0;
                         let (t, d) = when(h.start_ms);
-                        let head = format!("{} · {d} {t} · {}", h.camera, h.label);
+                        // Today's events don't need the date.
+                        let head = if d == when(js_sys::Date::now() as i64).1 {
+                            format!("{} · {t} · {}", h.camera, h.label)
+                        } else {
+                            format!("{} · {d} {t} · {}", h.camera, h.label)
+                        };
                         p.text(
                             pos2(x, row.top() + 14.0),
                             Align2::LEFT_CENTER,
@@ -315,13 +320,13 @@ impl Search {
                             TEXT_2,
                         );
                         if h.notable == Some(true) {
-                            let tag = Rect::from_min_size(
-                                pos2(row.right() - 68.0, row.top() + 6.0),
-                                vec2(62.0, 18.0),
-                            );
+                            // On the thumbnail's corner, clear of the text.
+                            let tag =
+                                Rect::from_min_size(thumb.min + vec2(4.0, 4.0), vec2(56.0, 17.0));
+                            p.rect_filled(tag, CornerRadius::same(8), BG.gamma_multiply(0.85));
                             p.rect_stroke(
                                 tag,
-                                CornerRadius::same(9),
+                                CornerRadius::same(8),
                                 Stroke::new(1.0, ALERT),
                                 StrokeKind::Inside,
                             );
@@ -329,7 +334,7 @@ impl Search {
                                 tag.center(),
                                 Align2::CENTER_CENTER,
                                 "notable",
-                                theme::regular(11.0),
+                                theme::regular(10.5),
                                 ALERT,
                             );
                         }
