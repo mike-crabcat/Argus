@@ -12,6 +12,11 @@ name = "argus"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+chrono-tz = "0.10"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 argus-ingest.workspace = true
 argus-agent.workspace = true
 argus-media.workspace = true

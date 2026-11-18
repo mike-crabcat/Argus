@@ -26,6 +26,8 @@
 //! * `POST /api/plan/import` (`{asset, level}`), `POST /api/plan/ask`
 //!   (`{text, level}`): the agent drafts plan commands (main token only;
 //!   nothing is saved until the editor sends them).
+//! * `/api/push/...`, `/api/alerts/...`, `/api/brief`: notifications,
+//!   alert rules and the daily brief (see [`crate::alerts_api`]).
 //! * `GET /api/agent/status`: whether a model is set up; spending for the
 //!   main token.
 //! * Anything else: static files from `[http] web_root` (the browser app),
@@ -83,6 +85,8 @@ pub struct AppState {
     pub plan: Option<Arc<crate::plan::PlanStore>>,
     /// The model, if `[agent]` is configured.
     pub agent: Option<Arc<crate::agent::AgentHandle>>,
+    /// Notifications, alert rules and briefs.
+    pub alerts: Option<Arc<crate::alerts_api::AlertsState>>,
 }
 
 /// Who made a request, set by the auth middleware.
@@ -162,6 +166,34 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/plan/assets/{id}", get(crate::plan::get_asset))
         .route("/api/agent/status", get(crate::agent::status))
+        .route("/api/push/key", get(crate::alerts_api::push_key))
+        .route(
+            "/api/push/subscribe",
+            axum::routing::post(crate::alerts_api::subscribe)
+                .delete(crate::alerts_api::unsubscribe),
+        )
+        .route(
+            "/api/push/test",
+            axum::routing::post(crate::alerts_api::push_test),
+        )
+        .route(
+            "/api/alerts/rules",
+            get(crate::alerts_api::list_rules).post(crate::alerts_api::add_rule),
+        )
+        .route(
+            "/api/alerts/rules/{id}",
+            axum::routing::put(crate::alerts_api::edit_rule).delete(crate::alerts_api::delete_rule),
+        )
+        .route(
+            "/api/alerts/rules/{id}/test",
+            axum::routing::post(crate::alerts_api::test_rule),
+        )
+        .route("/api/alerts/log", get(crate::alerts_api::alert_log))
+        .route("/api/brief", get(crate::alerts_api::get_brief))
+        .route(
+            "/api/brief/run",
+            axum::routing::post(crate::alerts_api::run_brief),
+        )
         .route(
             "/api/plan/import",
             axum::routing::post(crate::plan_agent::import),
@@ -207,6 +239,7 @@ async fn static_file(State(st): State<AppState>, uri: axum::http::Uri) -> Respon
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
         Some("json") => "application/json",
+        Some("webmanifest") => "application/manifest+json",
         _ => "application/octet-stream",
     };
     match tokio::fs::read(root.join(rel)).await {
@@ -347,6 +380,9 @@ async fn revoke_device(
     };
     match d.revoke(&id) {
         Ok(true) => {
+            if let Some(al) = &st.alerts {
+                let _ = al.notifier.subs.remove_device(&id);
+            }
             info!(%id, "device revoked");
             StatusCode::NO_CONTENT.into_response()
         }

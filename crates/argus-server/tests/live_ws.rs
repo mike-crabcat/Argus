@@ -47,6 +47,7 @@ async fn server_with(web_root: Option<std::path::PathBuf>) -> (String, Arc<LiveS
         public_url: None,
         plan: None,
         agent: None,
+        alerts: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

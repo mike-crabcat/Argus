@@ -14,4 +14,5 @@ rm -rf web/dist
 "${WASM_BINDGEN:-wasm-bindgen}" --target web --no-typescript --out-dir web/dist \
   target/wasm32-unknown-unknown/release/argus_web.wasm
 cp crates/argus-web/index.html web/dist/
+cp -r crates/argus-web/static/. web/dist/
 ls -l web/dist

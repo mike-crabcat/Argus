@@ -102,3 +102,19 @@ summarize = true                     # let the agent summarise this camera's eve
 # max_steps = 6
 # summaries = true               # summarise events in the background
 # summary_gap_seconds = 60       # at most one per camera per minute (merged)
+
+# Optional: alerts and the daily brief. Notifications go to browsers that
+# enable them in the viewer (Alerts, then "Enable notifications"; on an
+# iPhone, add Argus to the Home Screen first). Rules are added in the
+# viewer in plain English; with an [agent] the model turns them into
+# filters. These are the defaults:
+# [alerts]
+# timezone = "Australia/Perth"   # for rule times and the brief
+# brief_time = "07:00"           # daily brief (needs [agent])
+# brief = true
+# contact = "mailto:you@example.com"   # sent to push services; optional
+#
+# Also send alerts to an ntfy topic (https://ntfy.sh or your own server):
+# [alerts.ntfy]
+# url = "https://ntfy.sh/your-secret-topic"
+# token_file = "/home/you/.config/argus/ntfy-token"   # for protected topics

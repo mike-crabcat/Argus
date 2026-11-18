@@ -1,5 +1,6 @@
 //! Browser entry point and small web helpers.
 
+mod alerts;
 mod app;
 mod phones;
 mod plan;
