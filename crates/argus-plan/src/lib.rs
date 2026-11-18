@@ -12,6 +12,7 @@ pub mod command;
 pub mod fixture;
 pub mod geom;
 pub mod model;
+pub mod outline;
 pub mod rooms;
 pub mod snap;
 pub mod validate;

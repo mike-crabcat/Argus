@@ -378,6 +378,37 @@ pub mod http {
             .into_response()
     }
 
+    /// `GET /api/events?from=MS&to=MS&cameras=a,b`: events overlapping the
+    /// window (default: the last hour), oldest first, at most 2000.
+    pub async fn events(
+        State(st): State<AppState>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> Response {
+        let rec = match recordings_or_404(&st) {
+            Ok(r) => r,
+            Err(e) => return *e,
+        };
+        let now = crate::recorder::now_us() / 1000;
+        let from = int(&q, "from").unwrap_or(now - 3_600_000);
+        let to = int(&q, "to").unwrap_or(now + 60_000);
+        let index = rec.index.lock().unwrap();
+        let mut out = Vec::new();
+        for c in camera_list(&st, &q) {
+            match index.events(&c, from, to) {
+                Ok(evs) => out.extend(evs.into_iter().map(|(start, end, source, label)| {
+                    json!({"camera": c, "start_ms": start, "end_ms": end, "source": source, "label": label})
+                })),
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            }
+        }
+        out.sort_by_key(|e| e["start_ms"].as_i64().unwrap_or(0));
+        let skip = out.len().saturating_sub(2000);
+        let out: Vec<_> = out.into_iter().skip(skip).collect();
+        Json(json!({"from": from, "to": to, "now": now, "events": out})).into_response()
+    }
+
     pub async fn seek(
         State(st): State<AppState>,
         Query(q): Query<HashMap<String, String>>,

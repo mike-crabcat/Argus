@@ -11,6 +11,7 @@ use eframe::egui::{
 use eframe::egui_wgpu::RenderState;
 
 use super::phones::Phones;
+use super::plan::{MapAction, PlanView};
 use super::replay::Replay;
 use super::theme::{self, ACCENT, ALERT, BG, LINE, SURFACE, TEXT, TEXT_2, TEXT_3};
 use super::tile::{Status, Tile};
@@ -70,6 +71,8 @@ pub struct App {
     /// The timeline bar's rect and time range, [x, y, w, h, t0, t1], for
     /// scripts that want to click a time.
     timeline_rect_cache: Option<[f64; 6]>,
+    /// The floor plan, while the Map is shown.
+    map: Option<PlanView>,
     /// Phones added by QR code (admin only).
     phones: Phones,
     /// Whether `phones` knows our role for the current sign-in.
@@ -115,6 +118,7 @@ impl App {
             last_stats_ms: 0.0,
             hover_ms: None,
             timeline_rect_cache: None,
+            map: None,
             phones: Phones::default(),
             phones_loaded: false,
         }
@@ -129,7 +133,7 @@ impl App {
 
     /// Opens live tiles once the camera list is in, and reopens failed ones.
     fn connect(&mut self, ctx: &egui::Context, rs: &RenderState) {
-        if self.replay.is_some() {
+        if self.replay.is_some() || self.map.is_some() {
             return;
         }
         let cams = match &*self.cameras.borrow() {
@@ -186,6 +190,7 @@ impl App {
         self.tiles.clear();
         self.focus = None;
         self.phones.forget();
+        self.map = None;
         self.phones_loaded = false;
         *self.cameras.borrow_mut() = Cameras::NeedToken(None);
     }
@@ -295,6 +300,17 @@ impl App {
         self.fetch_spans(ctx);
     }
 
+    /// Shows the floor plan instead of the grid; video stops meanwhile.
+    fn start_map(&mut self, ctx: &egui::Context, rs: &RenderState) {
+        self.stop_replay(rs);
+        for t in self.tiles.iter_mut() {
+            t.release(rs);
+        }
+        self.tiles.clear();
+        self.focus = None;
+        self.map = Some(PlanView::new(self.token.clone(), ctx));
+    }
+
     fn stop_replay(&mut self, rs: &RenderState) {
         if let Some(mut r) = self.replay.take() {
             r.release(rs);
@@ -384,7 +400,14 @@ impl App {
         });
         let json = serde_json::json!({
             "backend": self.backend,
-            "mode": if self.replay.is_some() { "replay" } else { "live" },
+            "mode": if self.replay.is_some() {
+                "replay"
+            } else if self.map.is_some() {
+                "map"
+            } else {
+                "live"
+            },
+            "plan": self.map.as_ref().map(|m| m.stats()),
             "auth": match &*self.cameras.borrow() {
                 Cameras::NeedToken(_) => "token needed",
                 Cameras::Loaded(_) => "ok",
@@ -434,9 +457,11 @@ impl App {
         let pill = |x_right: f32, w: f32| {
             Rect::from_center_size(pos2(x_right - w / 2.0, cy), vec2(w, 26.0))
         };
-        let seg = pill(bar.right() - 16.0, 148.0);
-        let (live_r, replay_r) = seg.split_left_right_at_fraction(0.5);
+        let seg = pill(bar.right() - 16.0, 216.0);
+        let (live_r, rest) = seg.split_left_right_at_fraction(1.0 / 3.0);
+        let (replay_r, map_r) = rest.split_left_right_at_fraction(0.5);
         let in_replay = self.replay.is_some();
+        let in_map = self.map.is_some();
         p.rect_filled(seg, CornerRadius::same(theme::PILL_RADIUS), SURFACE);
         p.rect_stroke(
             seg,
@@ -444,14 +469,20 @@ impl App {
             Stroke::new(1.0, LINE),
             StrokeKind::Inside,
         );
-        let active = if in_replay { replay_r } else { live_r };
+        let active = if in_replay {
+            replay_r
+        } else if in_map {
+            map_r
+        } else {
+            live_r
+        };
         p.rect_stroke(
             active.shrink(2.0),
             CornerRadius::same(theme::PILL_RADIUS),
             Stroke::new(1.0, ACCENT),
             StrokeKind::Inside,
         );
-        let on = live > 0 && !in_replay;
+        let on = live > 0 && !in_replay && !in_map;
         p.circle_filled(
             pos2(live_r.left() + 17.0, cy),
             3.5,
@@ -462,7 +493,7 @@ impl App {
             Align2::LEFT_CENTER,
             "LIVE",
             theme::mono(11.0),
-            if in_replay { TEXT_2 } else { TEXT },
+            if in_replay || in_map { TEXT_2 } else { TEXT },
         );
         p.text(
             replay_r.center(),
@@ -471,21 +502,33 @@ impl App {
             theme::mono(11.0),
             if in_replay { TEXT } else { TEXT_2 },
         );
+        p.text(
+            map_r.center(),
+            Align2::CENTER_CENTER,
+            "MAP",
+            theme::mono(11.0),
+            if in_map { TEXT } else { TEXT_2 },
+        );
         let id = ui.scope_id();
         if ui
             .interact(live_r, id.with("live"), Sense::click())
             .clicked()
-            && in_replay
+            && (in_replay || in_map)
         {
             self.stop_replay(rs);
+            self.map = None;
         }
         if ui
             .interact(replay_r, id.with("replay"), Sense::click())
             .clicked()
             && !in_replay
         {
+            self.map = None;
             let t = now_us() as f64 / 1000.0 - 60_000.0;
             self.start_replay(ui.ctx(), rs, t);
+        }
+        if ui.interact(map_r, id.with("map"), Sense::click()).clicked() && !in_map {
+            self.start_map(ui.ctx(), rs);
         }
 
         let stats_r = pill(seg.left() - 8.0, 64.0);
@@ -959,6 +1002,29 @@ impl eframe::App for App {
                 };
                 if let Some(error) = need {
                     self.token_prompt(ui, area, error);
+                    return;
+                }
+                if self.map.is_some() {
+                    let names = self.camera_names();
+                    let admin = self.phones.is_admin();
+                    let full = ui.max_rect().expand(GAP);
+                    let action = self
+                        .map
+                        .as_mut()
+                        .and_then(|m| m.ui(ui, full, &names, admin));
+                    match action {
+                        Some(MapAction::Live(camera)) => {
+                            self.map = None;
+                            self.focus = names.iter().position(|n| *n == camera);
+                        }
+                        Some(MapAction::Replay { camera, t_ms }) => {
+                            self.map = None;
+                            // A few seconds before the event starts.
+                            self.start_replay(ui.ctx(), &rs, t_ms - 3000.0);
+                            self.set_focus(names.iter().position(|n| *n == camera));
+                        }
+                        None => {}
+                    }
                     return;
                 }
                 if let Cameras::Failed(e) = &*self.cameras.borrow() {
