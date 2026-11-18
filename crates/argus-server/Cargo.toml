@@ -20,6 +20,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 argus-ingest.workspace = true
 argus-agent.workspace = true
+argus-detect.workspace = true
 argus-media.workspace = true
 argus-plan.workspace = true
 argus-proto.workspace = true

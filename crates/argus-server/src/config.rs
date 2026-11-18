@@ -20,6 +20,30 @@ pub struct Config {
     pub agent: Option<argus_agent::config::AgentConfig>,
     /// Notifications, alert rules and the daily brief.
     pub alerts: Option<AlertsConfig>,
+    /// Argus's own object detection. Off without this section.
+    pub detect: Option<DetectConfig>,
+}
+
+/// `[detect]`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectConfig {
+    /// Pictures a second to look at, per camera.
+    #[serde(default = "default_detect_fps")]
+    pub fps: f64,
+    /// Which of each camera's streams to decode.
+    #[serde(default = "default_detect_stream")]
+    pub stream: String,
+    /// Cameras to run on; empty for all.
+    #[serde(default)]
+    pub cameras: Vec<String>,
+}
+
+fn default_detect_fps() -> f64 {
+    5.0
+}
+fn default_detect_stream() -> String {
+    "sub".into()
 }
 
 /// `[alerts]`.

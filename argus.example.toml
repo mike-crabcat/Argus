@@ -109,6 +109,14 @@ summarize = true                     # let the agent summarise this camera's eve
 # still_max_edge = 1280          # shrink stills to this many px for the model
                                  # (0: full size); the saved stills stay full size
 
+# Optional: Argus's own object detection (in progress). For now this
+# decodes each camera's sub stream and logs how long that takes; the
+# detector itself comes next.
+# [detect]
+# fps = 5                        # pictures a second to look at, per camera
+# stream = "sub"                 # which stream to decode (H.264)
+# cameras = []                   # empty: all
+
 # Optional: alerts and the daily brief. Notifications go to browsers that
 # enable them in the viewer (Alerts, then "Enable notifications"; on an
 # iPhone, add Argus to the Home Screen first). Rules are added in the

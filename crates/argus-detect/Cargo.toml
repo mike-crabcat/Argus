@@ -1,0 +1,17 @@
+[package]
+name = "argus-detect"
+description = "Object detection for Argus: decoding camera sub streams to pictures, and (later) finding people, vehicles and animals in them."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+argus-media.workspace = true
+bytes.workspace = true
+openh264 = "0.9"
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

@@ -3,6 +3,7 @@ pub mod alerts;
 pub mod alerts_api;
 pub mod brief;
 pub mod config;
+pub mod detect;
 pub mod devices;
 pub mod http;
 pub mod live;
