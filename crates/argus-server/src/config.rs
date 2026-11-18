@@ -157,6 +157,11 @@ pub struct EventsConfig {
     /// Which detections become events: any of motion, person, vehicle,
     /// animal. Default: person, vehicle, animal.
     pub labels: Option<Vec<String>>,
+    /// Take stills (camera snapshots) when an event starts. Default: true.
+    pub stills: Option<bool>,
+    /// Have the agent (if configured) summarise this camera's events.
+    /// Default: true.
+    pub summarize: Option<bool>,
 }
 
 impl std::fmt::Debug for EventsConfig {
@@ -195,6 +200,7 @@ pub struct ReolinkEvents {
     pub poll: std::time::Duration,
     pub hold: std::time::Duration,
     pub labels: Vec<String>,
+    pub stills: bool,
 }
 
 impl std::fmt::Debug for ReolinkEvents {
@@ -262,6 +268,14 @@ fn percent_decode(s: &str) -> String {
 }
 
 impl Camera {
+    /// Whether the agent should summarise this camera's events.
+    pub fn summarize(&self) -> bool {
+        self.events
+            .as_ref()
+            .and_then(|e| e.summarize)
+            .unwrap_or(true)
+    }
+
     /// Reolink event settings, if this camera's events come from Reolink.
     pub fn reolink_events(&self) -> Result<Option<ReolinkEvents>> {
         let ev = self.events.as_ref();
@@ -339,6 +353,7 @@ impl Camera {
             poll: std::time::Duration::from_millis(ev.map_or(1000, |e| e.poll_ms).max(200)),
             hold: std::time::Duration::from_millis(ev.map_or(5000, |e| e.hold_ms)),
             labels,
+            stills: ev.and_then(|e| e.stills).unwrap_or(true),
         }))
     }
 

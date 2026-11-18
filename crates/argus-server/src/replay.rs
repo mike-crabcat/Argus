@@ -391,21 +391,26 @@ pub mod http {
         let now = crate::recorder::now_us() / 1000;
         let from = int(&q, "from").unwrap_or(now - 3_600_000);
         let to = int(&q, "to").unwrap_or(now + 60_000);
-        let index = rec.index.lock().unwrap();
-        let mut out = Vec::new();
-        for c in camera_list(&st, &q) {
-            match index.events(&c, from, to) {
-                Ok(evs) => out.extend(evs.into_iter().map(|(start, end, source, label)| {
-                    json!({"camera": c, "start_ms": start, "end_ms": end, "source": source, "label": label})
-                })),
-                Err(e) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
-            }
-        }
-        out.sort_by_key(|e| e["start_ms"].as_i64().unwrap_or(0));
-        let skip = out.len().saturating_sub(2000);
-        let out: Vec<_> = out.into_iter().skip(skip).collect();
+        let stills = crate::stills::StillStore::new(&rec.root);
+        let rows = {
+            let index = rec.index.lock().unwrap();
+            let _ = index.index_new_events();
+            index.search_events(&argus_store::summaries::SearchQuery {
+                text: String::new(),
+                from_ms: Some(from),
+                to_ms: Some(to),
+                cameras: camera_list(&st, &q),
+                limit: 2000,
+            })
+        };
+        let mut out: Vec<serde_json::Value> = match rows {
+            Ok(r) => r
+                .iter()
+                .map(|e| crate::search::event_json(e, &stills))
+                .collect(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        out.reverse(); // oldest first
         Json(json!({"from": from, "to": to, "now": now, "events": out})).into_response()
     }
 
@@ -460,7 +465,8 @@ pub mod http {
             Ok(r) => r,
             Err(e) => return *e,
         };
-        let safe = (key.starts_with("rec/") || key.starts_with("init/"))
+        let still = key.starts_with("events/") && key.ends_with(".jpg");
+        let safe = (key.starts_with("rec/") || key.starts_with("init/") || still)
             && key
                 .split('/')
                 .all(|c| !c.is_empty() && c != "." && c != "..");
@@ -485,7 +491,9 @@ pub mod http {
                 _ => return StatusCode::NOT_FOUND.into_response(),
             },
         };
-        let ctype = if key.ends_with(".mp4") {
+        let ctype = if still {
+            "image/jpeg"
+        } else if key.ends_with(".mp4") {
             "video/mp4"
         } else {
             "video/iso.segment"

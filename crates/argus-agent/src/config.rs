@@ -50,6 +50,13 @@ pub struct AgentConfig {
     /// Tool-loop rounds before a run gives up.
     #[serde(default = "default_steps")]
     pub max_steps: usize,
+    /// Summarise events (with stills) in the background.
+    #[serde(default = "default_true")]
+    pub summaries: bool,
+    /// At most one summary per camera this often; events in between are
+    /// merged into it.
+    #[serde(default = "default_gap")]
+    pub summary_gap_seconds: u64,
     /// For provider = "mock": a JSON file of scripted answers.
     #[serde(default)]
     pub mock_script: Option<PathBuf>,
@@ -63,6 +70,12 @@ fn default_cap() -> f64 {
 }
 fn default_steps() -> usize {
     6
+}
+fn default_true() -> bool {
+    true
+}
+fn default_gap() -> u64 {
+    60
 }
 
 impl std::fmt::Debug for AgentConfig {

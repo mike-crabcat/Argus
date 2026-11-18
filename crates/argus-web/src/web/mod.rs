@@ -4,6 +4,7 @@ mod app;
 mod phones;
 mod plan;
 mod replay;
+mod search;
 mod theme;
 mod tile;
 

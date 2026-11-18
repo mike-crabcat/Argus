@@ -9,6 +9,7 @@
 //! No UI here: this crate builds for native and wasm alike.
 
 pub mod command;
+pub mod context;
 pub mod fixture;
 pub mod geom;
 pub mod model;

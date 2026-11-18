@@ -105,6 +105,56 @@ impl Client {
         parse_detections(&reply)
     }
 
+    /// A JPEG of what the camera sees now, at its main stream's resolution
+    /// (Reolink's Snap). Logs in (again) as needed.
+    pub async fn snap(&mut self) -> Result<Vec<u8>> {
+        match self.snap_once().await {
+            Err(e) if is_login_first(&e) => {
+                self.token = None;
+                self.snap_once().await
+            }
+            r => r,
+        }
+    }
+
+    async fn snap_once(&mut self) -> Result<Vec<u8>> {
+        let token = self.token().await?;
+        let mut url = self.api.clone();
+        let rs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        url.query_pairs_mut()
+            .append_pair("cmd", "Snap")
+            .append_pair("channel", "0")
+            .append_pair("rs", &format!("{rs:x}"))
+            .append_pair("token", &token);
+        // The URL carries the token: strip it from any error.
+        let bytes = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("Reolink Snap")?
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)
+            .context("Reolink Snap")?
+            .bytes()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("Reolink Snap")?;
+        if bytes.starts_with(&[0xFF, 0xD8]) {
+            return Ok(bytes.to_vec());
+        }
+        // Errors come back as JSON.
+        let reply: Vec<Value> =
+            serde_json::from_slice(&bytes).context("Reolink Snap: neither a JPEG nor JSON")?;
+        if let Some(r) = reply.first() {
+            check(r)?;
+        }
+        Err(anyhow!("Reolink Snap: no image in the reply"))
+    }
+
     /// Ends the session, if any (best effort; tokens also expire).
     pub async fn logout(&mut self) {
         if let Some((t, _)) = self.token.take() {
@@ -244,9 +294,28 @@ pub(crate) mod tests {
         pub expire_next: Mutex<bool>,
         pub password: String,
         pub requests: Mutex<Vec<String>>,
+        pub snaps: AtomicU32,
     }
 
     impl FakeCam {
+        /// Snap: a tiny JPEG-looking body numbered by the snap count, or
+        /// -6 for a stale token.
+        fn snap_reply(&self, query: &str) -> (&'static str, Vec<u8>) {
+            self.requests.lock().unwrap().push(query.to_owned());
+            let current = format!("token=tok{}", self.logins.load(Ordering::SeqCst));
+            if !query.contains(&current) {
+                return (
+                    "application/json",
+                    br#"[{"cmd":"Snap","code":1,"error":{"detail":"please login first","rspCode":-6}}]"#.to_vec(),
+                );
+            }
+            let n = self.snaps.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+            jpeg.extend(format!("snap {n}").bytes());
+            jpeg.extend([0xFF, 0xD9]);
+            ("image/jpeg", jpeg)
+        }
+
         fn reply(&self, query: &str, body: &str) -> String {
             self.requests
                 .lock()
@@ -318,12 +387,17 @@ pub(crate) mod tests {
                     let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
                     let query = head.split_whitespace().nth(1).unwrap_or("").to_owned();
                     let body = String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned();
-                    let reply = cam.reply(&query, &body);
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    let (ctype, reply) = if query.contains("cmd=Snap") {
+                        cam.snap_reply(&query)
+                    } else {
+                        ("application/json", cam.reply(&query, &body).into_bytes())
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         reply.len()
                     );
-                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&reply).await;
                 });
             }
         });
@@ -355,6 +429,22 @@ pub(crate) mod tests {
                 .all(|r| !r.split(' ').next().unwrap().contains("hunter2"))
         );
         assert!(reqs[1].starts_with("/api.cgi?cmd=GetMdState&token=tok1"));
+    }
+
+    #[tokio::test]
+    async fn snaps_a_jpeg_logging_in_again_if_needed() {
+        let c = cam();
+        let base = serve(c.clone()).await;
+        let mut client = Client::new(&base, "admin", "hunter2").unwrap();
+        let a = client.snap().await.unwrap();
+        assert!(a.starts_with(&[0xFF, 0xD8]) && a.ends_with(&[0xFF, 0xD9]));
+        // The camera forgets the token (reboot): one more login, then a snap.
+        c.logins.fetch_add(1, Ordering::SeqCst);
+        let b = client.snap().await.unwrap();
+        assert_ne!(a, b);
+        assert_eq!(c.snaps.load(Ordering::SeqCst), 2);
+        let reqs = c.requests.lock().unwrap().join("\n");
+        assert!(reqs.contains("cmd=Snap&channel=0"));
     }
 
     #[tokio::test]

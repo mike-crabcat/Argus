@@ -1213,12 +1213,16 @@ impl PlanView {
         let text = if let Some((_, i)) = hit {
             let e = &self.events[*i];
             let (hms, _) = local_hms(e.start_ms as f64);
-            Some(format!(
+            let line = format!(
                 "{} · {} · {hms} ({}) · tap to replay",
                 e.label,
                 e.camera,
                 crate::ago(now, e.start_ms as f64)
-            ))
+            );
+            Some(match &e.summary {
+                Some(s) => format!("{s}\n{line}"),
+                None => line,
+            })
         } else {
             l.cameras
                 .iter()
@@ -1227,7 +1231,7 @@ impl PlanView {
         };
         if let Some(t) = text {
             p.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            let g = p.layout_no_wrap(t, theme::regular(12.0), TEXT);
+            let g = p.layout(t, theme::regular(12.0), TEXT, 380.0);
             let mut r = Rect::from_min_size(ptr + vec2(14.0, 12.0), g.size() + vec2(16.0, 10.0));
             if r.right() > canvas.right() - 4.0 {
                 r = r.translate(vec2(-(r.width() + 28.0), 0.0));

@@ -13,6 +13,7 @@ use eframe::egui_wgpu::RenderState;
 use super::phones::Phones;
 use super::plan::{MapAction, PlanView};
 use super::replay::Replay;
+use super::search::{Search, SearchAction};
 use super::theme::{self, ACCENT, ALERT, BG, LINE, SURFACE, TEXT, TEXT_2, TEXT_3};
 use super::tile::{Status, Tile};
 use super::{
@@ -73,6 +74,8 @@ pub struct App {
     timeline_rect_cache: Option<[f64; 6]>,
     /// The floor plan, while the Map is shown.
     map: Option<PlanView>,
+    /// Event search: the box and its results panel.
+    search: Search,
     /// Phones added by QR code (admin only).
     phones: Phones,
     /// Whether `phones` knows our role for the current sign-in.
@@ -119,6 +122,7 @@ impl App {
             hover_ms: None,
             timeline_rect_cache: None,
             map: None,
+            search: Search::default(),
             phones: Phones::default(),
             phones_loaded: false,
         }
@@ -408,6 +412,7 @@ impl App {
                 "live"
             },
             "plan": self.map.as_ref().map(|m| m.stats()),
+            "search": self.search.stats(),
             "auth": match &*self.cameras.borrow() {
                 Cameras::NeedToken(_) => "token needed",
                 Cameras::Loaded(_) => "ok",
@@ -555,8 +560,40 @@ impl App {
             theme::regular(12.5),
             if self.show_stats { TEXT } else { TEXT_2 },
         );
-        // Phones (admin only): add a phone by QR code, or revoke one.
         let mut left = stats_r.left();
+        let loaded = matches!(*self.cameras.borrow(), Cameras::Loaded(_));
+        let wide = bar.width() >= 900.0;
+        // Narrow screens: a Search pill opens the search panel.
+        if loaded && !wide {
+            let sr = pill(left - 8.0, 66.0);
+            let resp = ui.interact(sr, id.with("search"), Sense::click());
+            if resp.clicked() {
+                self.search.show();
+            }
+            p.rect_filled(sr, CornerRadius::same(theme::PILL_RADIUS), SURFACE);
+            p.rect_stroke(
+                sr,
+                CornerRadius::same(theme::PILL_RADIUS),
+                Stroke::new(
+                    1.0,
+                    if resp.hovered() || self.search.open {
+                        ACCENT
+                    } else {
+                        LINE
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            p.text(
+                sr.center(),
+                Align2::CENTER_CENTER,
+                "Search",
+                theme::regular(12.5),
+                TEXT_2,
+            );
+            left = sr.left();
+        }
+        // Phones (admin only): add a phone by QR code, or revoke one.
         if self.phones.is_admin() && matches!(*self.cameras.borrow(), Cameras::Loaded(_)) {
             let phones_r = pill(left - 8.0, 72.0);
             let resp = ui.interact(phones_r, id.with("phones"), Sense::click());
@@ -601,16 +638,36 @@ impl App {
                 pos2(backend.left() - 16.0 - g.size().x, cy - g.size().y / 2.0),
                 g.size(),
             );
-            if r.left() < min_x {
-                return;
+            if r.left() >= min_x {
+                let resp = ui.interact(r.expand(4.0), id.with("signout"), Sense::click());
+                let color = if resp.hovered() { TEXT } else { TEXT_2 };
+                p.galley(r.min, g, color);
+                if resp.clicked() {
+                    self.sign_out(rs);
+                    return;
+                }
+                left_used = r.left();
             }
-            let resp = ui.interact(r.expand(4.0), id.with("signout"), Sense::click());
-            let color = if resp.hovered() { TEXT } else { TEXT_2 };
-            p.galley(r.min, g, color);
-            if resp.clicked() {
-                self.sign_out(rs);
+        }
+        // Wide screens: the search box, after the title and count.
+        if loaded && wide {
+            let x = title.right() + 130.0;
+            let w = (left_used - 24.0 - x).min(340.0);
+            if w >= 180.0 {
+                let r = Rect::from_min_size(pos2(x, cy - 14.0), vec2(w, 28.0));
+                let edit = ui.put(
+                    r,
+                    egui::TextEdit::singleline(&mut self.search.query)
+                        .hint_text("Search events…")
+                        .margin(vec2(12.0, 6.0))
+                        .desired_width(w),
+                );
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let token = self.token.clone();
+                    self.search.run(token, ui.ctx());
+                }
+                left_used = left_used.min(x + w + 400.0);
             }
-            left_used = r.left();
         }
         // The camera count, if there's room left.
         let what = match &*self.cameras.borrow() {
@@ -1089,6 +1146,31 @@ impl eframe::App for App {
             });
         self.phones
             .ui(ctx, self.token.clone(), now_us() as f64 / 1000.0);
+        // Search results, over the right of everything below the bar.
+        if self.search.open {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.search.open = false;
+            }
+            let c = ctx.content_rect();
+            let w = c.width().min(460.0);
+            let panel = Rect::from_min_max(pos2(c.right() - w, c.top() + 44.0), c.max);
+            let token = self.token.clone();
+            let action = egui::Area::new(egui::Id::unique("argus-search"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(panel.min)
+                .show(ctx, |ui| {
+                    ui.set_min_size(panel.size());
+                    self.search.ui(ui, panel, token)
+                })
+                .inner;
+            if let Some(SearchAction::Replay { camera, t_ms }) = action {
+                let names = self.camera_names();
+                self.map = None;
+                self.search.open = false;
+                self.start_replay(ctx, &rs, t_ms - 3000.0);
+                self.set_focus(names.iter().position(|n| *n == camera));
+            }
+        }
         // Keep the stats readout fresh even without new frames.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }

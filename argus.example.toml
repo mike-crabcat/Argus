@@ -81,6 +81,8 @@ upload.main = "always"
 labels = ["person", "vehicle", "animal", "motion"]   # default: no motion
 poll_ms = 1000
 hold_ms = 5000                       # end an event 5 s after last detection
+stills = true                        # snapshots at +0, +2 and +5 s (Snap API)
+summarize = true                     # let the agent summarise this camera's events
 
 # Optional: a model for agent features (importing a floor plan from a
 # sketch, "ask the agent to change the plan"). Any OpenAI-compatible
@@ -98,3 +100,5 @@ hold_ms = 5000                       # end an event 5 s after last detection
 # price_output_per_mtok = 1.5
 # timeout_seconds = 120
 # max_steps = 6
+# summaries = true               # summarise events in the background
+# summary_gap_seconds = 60       # at most one per camera per minute (merged)

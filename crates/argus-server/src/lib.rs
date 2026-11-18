@@ -9,5 +9,8 @@ pub mod recorder;
 pub mod reolink;
 pub mod replay;
 pub mod s3;
+pub mod search;
+pub mod stills;
+pub mod summaries;
 pub mod timearg;
 pub mod triggers;

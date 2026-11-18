@@ -228,6 +228,28 @@ async fn run(cfg: Config) -> Result<()> {
                 .as_deref()
                 .map(|u| Arc::from(u.trim_end_matches('/'))),
         };
+        // Event summaries, if a model is set up.
+        if let (Some(handle), Some(ac)) = (&state.agent, &cfg.agent)
+            && handle.agent.is_ok()
+            && ac.summaries
+        {
+            let worker = argus_server::summaries::Worker {
+                agent: handle.clone(),
+                index: index.clone(),
+                plan: state.plan.clone(),
+                stills: argus_server::stills::StillStore::new(&cfg.storage.root),
+                opted_out: cfg
+                    .cameras
+                    .iter()
+                    .filter(|c| !c.summarize())
+                    .map(|c| c.name.clone())
+                    .collect(),
+                gap_ms: ac.summary_gap_seconds as i64 * 1000,
+                paused_until: 0,
+            };
+            info!(gap_s = ac.summary_gap_seconds, "summarising events");
+            background.push(tokio::spawn(worker.run()));
+        }
         info!(listen = %h.listen, auth = h.token.is_some(), version = http::VERSION,
           "HTTP API and live view");
         background.push(tokio::spawn(async move {
@@ -243,8 +265,26 @@ async fn run(cfg: Config) -> Result<()> {
         info!(camera = %cam.name, api = %ev.base, labels = ?ev.labels,
               "events from camera detections");
         let client = reolink::Client::new(&ev.base, &ev.user, &ev.password)?;
-        let t =
+        let mut t =
             triggers::ReolinkTriggers::new(&cam.name, client, ev.hold, ev.labels, index.clone());
+        if ev.stills {
+            // Stills from the camera's Snap API, on a session of their own.
+            let snaps: Arc<dyn argus_server::stills::StillSource> =
+                Arc::new(argus_server::stills::ReolinkSnaps::new(
+                    reolink::Client::new(&ev.base, &ev.user, &ev.password)?,
+                ));
+            let store = argus_server::stills::StillStore::new(&cfg.storage.root);
+            let name = cam.name.clone();
+            t = t.on_start(move |id| {
+                tokio::spawn(argus_server::stills::capture(
+                    store.clone(),
+                    snaps.clone(),
+                    name.clone(),
+                    id,
+                    &argus_server::stills::OFFSETS_MS,
+                ));
+            });
+        }
         background.push(tokio::spawn(t.run(ev.poll)));
     }
 
@@ -274,13 +314,20 @@ async fn run(cfg: Config) -> Result<()> {
                 let (index, root, cfg) = (index.clone(), root.clone(), cfg.clone());
                 let res = tokio::task::spawn_blocking(move || {
                     let index = index.lock().unwrap();
-                    upload::evict(
+                    let ev = upload::evict(
                         &index,
                         &root,
                         budget,
                         |c, s| cfg.policy(c, s),
                         upload::now_ms(),
-                    )
+                    );
+                    // Event stills go with their recordings.
+                    match argus_server::stills::StillStore::new(&root).expire(&index) {
+                        Ok(n) if n > 0 => info!(events = n, "removed old event stills"),
+                        Ok(_) => {}
+                        Err(e) => warn!("expiring event stills: {e:#}"),
+                    }
+                    ev
                 })
                 .await;
                 match res {

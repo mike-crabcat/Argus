@@ -8,6 +8,9 @@
 //!   camera, for a timeline.
 //! * `GET /api/events?from=MS&to=MS&cameras=a,b`: events (camera, start,
 //!   end, source, label), for the map.
+//! * `GET /api/events/search?q=...&from=MS&to=MS&cameras=a,b&smart=1`:
+//!   events by summary, label and camera, with their stills
+//!   (`/api/media/events/{id}/{n}.jpg`).
 //! * `GET /api/seek?t=MS&stream=sub&cameras=a,b`: for each camera, the init
 //!   segment and the GOP containing `t` (chunk key and byte range).
 //! * `GET /api/media/{key}`: an init segment or chunk file, with `Range`.
@@ -137,6 +140,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/recordings", get(crate::replay::http::recordings))
         .route("/api/seek", get(crate::replay::http::seek))
         .route("/api/events", get(crate::replay::http::events))
+        .route("/api/events/search", get(crate::search::search))
         .route("/api/media/{*key}", get(crate::replay::http::media))
         .route("/api/replay", get(crate::replay::http::replay_ws))
         .route("/api/info", get(info))
