@@ -353,7 +353,15 @@ impl PlanView {
                     self.note(format!("Couldn't save: {e}"));
                     self.last_edit_ms = now_ms() + 5000.0;
                 }
-                Msg::Uploaded { id, w, h } => self.place_background(id, w, h),
+                Msg::Uploaded { id, w, h } => {
+                    if self.agent_ready() {
+                        // A model is set up: it reads the plan, scales it and
+                        // draws it as a draft to accept or discard.
+                        self.import_asset(ctx, id);
+                    } else {
+                        self.place_background(id, w, h);
+                    }
+                }
                 Msg::Failed(e) => self.note(e),
                 Msg::Events(e) => self.events = e,
                 Msg::AgentStatus(v) => self.agent = Some(v),
@@ -730,6 +738,51 @@ impl PlanView {
         self.drag = None;
         self.preview = None;
         self.edit = None;
+    }
+
+    /// Shows the draft's new walls, rooms and cameras (wherever the agent
+    /// put them), or everything if it added none.
+    fn fit_draft(&mut self) {
+        let r = self.canvas;
+        let (Some(d), Some(l)) = (&self.doc, self.level()) else {
+            return;
+        };
+        let ids = d.draft_ids();
+        let mut pts: Vec<Point> = l
+            .nodes
+            .iter()
+            .filter(|n| ids.contains(&n.id))
+            .map(|n| n.at)
+            .collect();
+        for w in l.walls.iter().filter(|w| ids.contains(&w.id)) {
+            pts.extend(l.wall_ends(w).map(|(a, b)| [a, b]).into_iter().flatten());
+        }
+        pts.extend(l.rooms.iter().filter(|x| ids.contains(&x.id)).map(|x| x.at));
+        pts.extend(
+            l.cameras
+                .iter()
+                .filter(|x| ids.contains(&x.id))
+                .map(|x| x.at),
+        );
+        let Some(first) = pts.first().copied() else {
+            return;
+        };
+        if r.width() < 10.0 {
+            return;
+        }
+        let (lo, hi) = pts.iter().fold((first, first), |(lo, hi), p| {
+            (
+                pt(lo.x.min(p.x), lo.y.min(p.y)),
+                pt(hi.x.max(p.x), hi.y.max(p.y)),
+            )
+        });
+        let margin = (r.width().min(r.height()) * 0.08).max(60.0);
+        self.view = Some(View::fit(
+            lo,
+            hi,
+            (r.min.x, r.min.y, r.width(), r.height()),
+            margin,
+        ));
     }
 
     fn fit(&mut self) {
@@ -1938,7 +1991,13 @@ impl PlanView {
         if (btn(ui, "Apply").clicked() || enter)
             && let (Some(a), Some(b)) = (self.first_click, to)
         {
-            match argus_plan::snap::parse_length(&self.scale_input) {
+            let input = self.scale_input.trim().to_owned();
+            match argus_plan::snap::parse_length(&input) {
+                // A bare number under 100 is metres: nobody measures a
+                // plan's scale over 11 mm.
+                Some(real) if real < 100.0 && input.parse::<f64>().is_ok() => {
+                    self.apply_scale(a, b, real * 1000.0)
+                }
                 Some(real) => self.apply_scale(a, b, real),
                 None => self.note("Type a distance such as 3600 or 3.6m."),
             }
@@ -2022,6 +2081,30 @@ impl PlanView {
             q.push(msg);
             ctx.request_repaint();
         });
+    }
+
+    /// Whether a model is set up for plan drafting.
+    fn agent_ready(&self) -> bool {
+        self.agent
+            .as_ref()
+            .is_some_and(|a| a["configured"].as_bool() == Some(true))
+    }
+
+    /// Has the agent draw the level from an uploaded image.
+    fn import_asset(&mut self, ctx: &egui::Context, asset: String) {
+        if let Some(d) = &self.doc
+            && d.dirty()
+        {
+            self.save(ctx);
+        }
+        self.agent_busy = Some("The agent is reading the plan…".into());
+        Self::agent_request(
+            self.inbox.clone(),
+            self.token.clone(),
+            ctx.clone(),
+            "/api/plan/import",
+            serde_json::json!({ "asset": asset, "level": self.level_id().0 }),
+        );
     }
 
     fn agent_import(&mut self, ctx: &egui::Context) {
@@ -2119,6 +2202,7 @@ impl PlanView {
                 self.ask_text.clear();
                 self.sel.clear();
                 self.view = None;
+                self.fit_draft();
                 self.agent_asked = false; // refresh the spend shown
             }
             Err(e) => self.note(format!(
@@ -2295,7 +2379,14 @@ impl PlanView {
         heading(ui, "Background image");
         match l.background.clone() {
             None => {
-                hint(ui, "A scanned plan or a sketch to trace over. PNG or JPEG.");
+                hint(
+                    ui,
+                    if self.agent_ready() {
+                        "A scanned plan, a sketch or a photo of one (PNG or JPEG). The agent draws the plan from it as a draft for you to check."
+                    } else {
+                        "A scanned plan or a sketch to trace over. PNG or JPEG."
+                    },
+                );
                 if btn(ui, "Upload image…").clicked() {
                     self.upload(ui.ctx());
                 }
@@ -2328,6 +2419,13 @@ impl PlanView {
                         background: Some(b),
                     });
                     self.preview = Some(p);
+                }
+                if self.agent_ready()
+                    && self.agent_busy.is_none()
+                    && btn(ui, "Draw it with the agent").clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.import_asset(&ctx, bg.asset.clone());
                 }
                 ui.horizontal(|ui| {
                     if btn(ui, "Set scale").clicked() {

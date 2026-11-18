@@ -212,6 +212,18 @@ async fn import_corrects_a_mistake_then_ask_changes_it() {
     let reqs = mock.requests.lock().unwrap().clone();
     let asked = reqs.last().unwrap().messages[1].joined_text();
     assert!(asked.contains("the garage is 6.2 m deep") && asked.contains("\"walls\""));
+    // It saw the background too, and where its pixels are on the plan.
+    assert!(
+        asked.contains("background image is attached") && asked.contains("covers 16.0 m by 11.0 m"),
+        "{asked}"
+    );
+    assert!(!asked.contains("looks wrong"));
+    assert!(
+        reqs.last().unwrap().messages[1]
+            .parts
+            .iter()
+            .any(|p| matches!(p, argus_agent::Part::Image { .. }))
+    );
     let (code, _) = s
         .post(
             "/api/plan/commands",
