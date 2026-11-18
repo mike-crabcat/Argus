@@ -87,6 +87,9 @@ hold_ms = 5000                       # end an event 5 s after last detection
 stills = true                        # snapshots at +0, +2 and +5 s (Snap API)
 summarize = true                     # let the agent summarise this camera's events
 # summary_gap_seconds = 600          # this camera's own gap (default: [agent]'s)
+# detect = "shadow"                  # with [detect]: "shadow" stores Argus's tracks
+                                     # to compare; "events" makes this camera's
+                                     # events from them instead
 
 # Optional: a model for agent features (importing a floor plan from a
 # sketch, "ask the agent to change the plan"). Any OpenAI-compatible
@@ -111,8 +114,8 @@ summarize = true                     # let the agent summarise this camera's eve
 
 # Optional: Argus's own object detection (in progress). Each camera's sub
 # stream is decoded on the CPU and 5 pictures a second go to the model on
-# the GPU; for now what it finds is only logged. The model is D-FINE-S
-# (Apache-2.0): download onnx/model.onnx from
+# the GPU. What moves is stored as tracks; see events.detect per camera.
+# The model is D-FINE-S (Apache-2.0): download onnx/model.onnx from
 # https://huggingface.co/onnx-community/dfine_s_coco-ONNX (41 MB). The
 # Docker image has CUDA; give the container the GPU (see docs/deploy.md).
 # [detect]

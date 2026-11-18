@@ -1,8 +1,9 @@
 //! Argus's own detection. Per camera, a thread decodes the stream
 //! `[detect]` names (the sub stream by default) as it arrives and picks
 //! pictures at a steady rate; one more thread runs the model over the
-//! pictures from all cameras, in batches. For now what it finds only feeds
-//! counters in the log; tracks and events come next.
+//! pictures from all cameras, in batches, and [`Tracking`] turns what it
+//! finds into tracks: each moving spell is stored, and per camera can also
+//! become an event in place of the camera's own.
 //!
 //! Decoding is steady CPU work (about 0.5-1 ms a frame at 896x672) that
 //! shouldn't sit on the async runtime. It reads the same broadcast as live
@@ -10,13 +11,16 @@
 //! next keyframe). If the model falls behind, pictures are dropped rather
 //! than queued.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use argus_detect::decode::{Decoder, Picture, Sampler};
 use argus_detect::model::{Detection, Prepared};
+use argus_detect::track::{Change, Params as TrackParams, Seen, Tracker};
+use argus_store::Index;
+use argus_store::tracks::TrackBox;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, warn};
 
@@ -142,6 +146,9 @@ fn report(camera: &str, last: &Counts, now: &Counts, over: Duration) {
 pub struct Found {
     pub camera: Arc<str>,
     pub wall_us: i64,
+    /// The picture's size (the boxes are in its pixels).
+    pub width: u32,
+    pub height: u32,
     pub detections: Vec<Detection>,
 }
 
@@ -198,6 +205,8 @@ pub fn run_model(
                     out(Found {
                         camera: camera.clone(),
                         wall_us: p.wall_us,
+                        width: p.width,
+                        height: p.height,
                         detections,
                     });
                 }
@@ -254,6 +263,179 @@ fn sender(
     }
 }
 
+/// What a camera's tracks become.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Stored as tracks only, to compare with the camera's own events.
+    Shadow,
+    /// Also events (source "argus"), in place of the camera's own.
+    Events,
+}
+
+/// Runs `f` with the id of each new event (to take stills).
+pub type OnEvent = Arc<dyn Fn(i64) + Send + Sync>;
+
+/// Boxes are written at most this often while a track moves.
+const FLUSH_US: i64 = 1_000_000;
+
+struct Spell {
+    track_id: i64,
+    event_id: Option<i64>,
+    boxes: Vec<TrackBox>,
+    flushed_us: i64,
+}
+
+struct CameraTracks {
+    mode: Mode,
+    tracker: Tracker,
+    spells: HashMap<u64, Spell>,
+    on_event: Option<OnEvent>,
+}
+
+/// Turns what the model finds into tracks (and, per camera, events).
+pub struct Tracking {
+    index: Arc<Mutex<Index>>,
+    cameras: HashMap<Arc<str>, CameraTracks>,
+}
+
+fn ms(us: i64) -> i64 {
+    us.div_euclid(1000)
+}
+
+impl Tracking {
+    pub fn new(index: Arc<Mutex<Index>>) -> Self {
+        Self {
+            index,
+            cameras: HashMap::new(),
+        }
+    }
+
+    /// Tracks `camera`: `hold` is how long a track may sit still before
+    /// its moving spell (and event) ends.
+    pub fn camera(&mut self, camera: &str, mode: Mode, hold: Duration, on_event: Option<OnEvent>) {
+        let params = TrackParams {
+            hold_us: hold.as_micros() as i64,
+            ..TrackParams::default()
+        };
+        self.cameras.insert(
+            camera.into(),
+            CameraTracks {
+                mode,
+                tracker: Tracker::new(params),
+                spells: HashMap::new(),
+                on_event,
+            },
+        );
+    }
+
+    pub fn feed(&mut self, f: &Found) {
+        let Some(c) = self.cameras.get_mut(&f.camera) else {
+            return;
+        };
+        let seen: Vec<Seen> = f
+            .detections
+            .iter()
+            .map(|d| Seen {
+                label: d.label,
+                class: d.class,
+                score: d.score,
+                bbox: d.bbox,
+            })
+            .collect();
+        let changes = c.tracker.update(f.wall_us, &seen);
+        if changes.is_empty() {
+            return;
+        }
+        let index = self.index.lock().unwrap();
+        for ch in changes {
+            let r = match ch {
+                Change::Moving(t) => {
+                    let start = ms(t.moving_since_us.unwrap_or(t.last_us));
+                    let event_id = match c.mode {
+                        Mode::Events => index
+                            .add_event(&f.camera, start, ms(t.last_us), "argus", t.label)
+                            .ok(),
+                        Mode::Shadow => None,
+                    };
+                    let r = index.add_track(
+                        &f.camera,
+                        t.label,
+                        t.class,
+                        start,
+                        t.best_score,
+                        f.width,
+                        f.height,
+                        event_id,
+                    );
+                    if let Some(id) = event_id {
+                        info!(camera = %f.camera, label = t.label, "event started (detection)");
+                        if let Some(cb) = &c.on_event {
+                            cb(id);
+                        }
+                    }
+                    r.map(|track_id| {
+                        c.spells.insert(
+                            t.id,
+                            Spell {
+                                track_id,
+                                event_id,
+                                boxes: vec![tbox(&t)],
+                                flushed_us: t.last_us,
+                            },
+                        );
+                    })
+                }
+                Change::StillMoving(t) => match c.spells.get_mut(&t.id) {
+                    Some(s) => {
+                        s.boxes.push(tbox(&t));
+                        if t.last_us - s.flushed_us >= FLUSH_US {
+                            s.flushed_us = t.last_us;
+                            flush(&index, s, &t, ms(t.last_us))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    None => Ok(()),
+                },
+                Change::Stopped(t) => match c.spells.remove(&t.id) {
+                    Some(mut s) => {
+                        let end = ms(t.last_us);
+                        s.boxes.retain(|b| b.t_ms <= end);
+                        flush(&index, &mut s, &t, end)
+                    }
+                    None => Ok(()),
+                },
+                Change::Ended(_) => Ok(()),
+            };
+            if let Err(e) = r {
+                warn!(camera = %f.camera, "storing a track: {e:#}");
+            }
+        }
+    }
+}
+
+fn tbox(t: &argus_detect::track::Track) -> TrackBox {
+    TrackBox {
+        t_ms: ms(t.last_us),
+        bbox: t.bbox,
+        score: t.best_score,
+    }
+}
+
+fn flush(
+    index: &Index,
+    s: &mut Spell,
+    t: &argus_detect::track::Track,
+    end_ms: i64,
+) -> anyhow::Result<()> {
+    index.extend_track(s.track_id, end_ms, t.class, t.best_score, &s.boxes)?;
+    s.boxes.clear();
+    if let Some(id) = s.event_id {
+        index.set_event_end(id, end_ms)?;
+    }
+    Ok(())
+}
+
 /// How `[detect]` runs the model.
 pub struct ModelSpec {
     pub path: std::path::PathBuf,
@@ -262,8 +444,13 @@ pub struct ModelSpec {
 }
 
 /// Starts a decoding thread for each stream and, with a model, the thread
-/// that runs it.
-pub fn spawn(streams: Vec<Arc<LiveStream>>, fps: f64, model: Option<ModelSpec>) {
+/// that runs it, feeding `tracking`.
+pub fn spawn(
+    streams: Vec<Arc<LiveStream>>,
+    fps: f64,
+    model: Option<ModelSpec>,
+    mut tracking: Tracking,
+) {
     let tx = model.map(|spec| {
         let (tx, rx) = std::sync::mpsc::sync_channel(2 * MAX_BATCH);
         let r = std::thread::Builder::new()
@@ -283,7 +470,7 @@ pub fn spawn(streams: Vec<Arc<LiveStream>>, fps: f64, model: Option<ModelSpec>) 
                 run_model(
                     rx,
                     |p| m.detect_prepared(p).map_err(|e| e.to_string()),
-                    |_| {},
+                    |f| tracking.feed(&f),
                 );
             });
         if let Err(e) = r {
@@ -443,5 +630,148 @@ mod tests {
             [(0, n), (1, n)],
             "prepared; the rest dropped, not queued"
         );
+    }
+
+    fn walker(camera: &str, i: i64, present: bool) -> Found {
+        Found {
+            camera: camera.into(),
+            wall_us: 1_800_000_000_000_000 + i * 200_000,
+            width: 896,
+            height: 672,
+            detections: if present {
+                let x = 100.0 + 15.0 * i as f32;
+                vec![Detection {
+                    label: "person",
+                    class: "person",
+                    score: 0.9,
+                    bbox: [x, 200.0, x + 50.0, 320.0],
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    #[test]
+    fn tracks_become_events_only_where_asked() {
+        let index = Arc::new(Mutex::new(Index::open_in_memory().unwrap()));
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let s2 = started.clone();
+        let mut t = Tracking::new(index.clone());
+        t.camera(
+            "door",
+            Mode::Events,
+            Duration::from_secs(5),
+            Some(Arc::new(move |id| s2.lock().unwrap().push(id))),
+        );
+        t.camera("yard", Mode::Shadow, Duration::from_secs(5), None);
+        // A person walks past each camera for 4 s, then is gone for 3 s.
+        for i in 0..35 {
+            t.feed(&walker("door", i, i < 20));
+            t.feed(&walker("yard", i, i < 20));
+        }
+        // An unknown camera is ignored.
+        t.feed(&walker("garage", 0, true));
+        let i = index.lock().unwrap();
+        let tracks = i.tracks(None, 0, i64::MAX).unwrap();
+        assert_eq!(tracks.len(), 2, "{tracks:?}");
+        let door = tracks.iter().find(|t| t.camera == "door").unwrap();
+        let yard = tracks.iter().find(|t| t.camera == "yard").unwrap();
+        assert!(yard.event_id.is_none());
+        let ev = door.event_id.expect("an event on the door camera");
+        assert_eq!(*started.lock().unwrap(), [ev], "stills were asked for");
+        let t0 = 1_800_000_000_000i64;
+        // Moving from picture 2 (confirmed at its third sighting, having
+        // moved 15 px, more than a quarter of its width); last seen at 19.
+        assert_eq!(door.start_ms, t0 + 400);
+        assert_eq!(door.end_ms, t0 + 19 * 200);
+        assert_eq!(
+            (door.width, door.height, door.label.as_str()),
+            (896, 672, "person")
+        );
+        let events = i.events("door", 0, i64::MAX).unwrap();
+        assert_eq!(
+            events,
+            [(door.start_ms, door.end_ms, "argus".into(), "person".into())]
+        );
+        assert!(i.events("yard", 0, i64::MAX).unwrap().is_empty());
+        // Every picture from when the spell was reported (its third moving
+        // picture) to the end has its box.
+        let boxes = i.track_boxes(door.id).unwrap();
+        assert_eq!(
+            boxes.len(),
+            16,
+            "{:?}",
+            boxes.iter().map(|b| b.t_ms - t0).collect::<Vec<_>>()
+        );
+        assert_eq!(boxes.last().unwrap().t_ms, door.end_ms);
+    }
+}
+
+/// The detection API: tracks, and how they compare with the cameras' own
+/// events (for shadow mode).
+pub mod http {
+    use std::collections::HashMap;
+
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Json, Response};
+    use serde_json::json;
+
+    use crate::http::AppState;
+    use crate::replay::http::{int, recordings_or_404};
+
+    /// `GET /api/detect/compare?hours=24`: per camera, the camera's own
+    /// events and Argus's tracks over the last `hours`, and how many of
+    /// each the other also saw.
+    pub async fn compare(
+        State(st): State<AppState>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> Response {
+        let rec = match recordings_or_404(&st) {
+            Ok(r) => r,
+            Err(e) => return *e,
+        };
+        let now = crate::recorder::now_us() / 1000;
+        let hours = int(&q, "hours").unwrap_or(24).clamp(1, 24 * 31);
+        let from = now - hours * 3_600_000;
+        match rec.index.lock().unwrap().compare_tracks(from, now) {
+            Ok(c) => Json(json!({"from": from, "to": now, "cameras": c})).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    }
+
+    /// `GET /api/detect/tracks?camera=&from=&to=&boxes=1`: tracks (moving
+    /// spells), oldest first, optionally with their boxes.
+    pub async fn tracks(
+        State(st): State<AppState>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> Response {
+        let rec = match recordings_or_404(&st) {
+            Ok(r) => r,
+            Err(e) => return *e,
+        };
+        let now = crate::recorder::now_us() / 1000;
+        let from = int(&q, "from").unwrap_or(now - 3_600_000);
+        let to = int(&q, "to").unwrap_or(now + 60_000);
+        let with_boxes = q.get("boxes").is_some_and(|v| v == "1");
+        let index = rec.index.lock().unwrap();
+        let rows = match index.tracks(q.get("camera").map(String::as_str), from, to) {
+            Ok(r) => r,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        let out: Vec<serde_json::Value> = rows
+            .iter()
+            .take(5000)
+            .map(|t| {
+                let mut v = serde_json::to_value(t).unwrap_or_default();
+                if with_boxes {
+                    v["boxes"] = serde_json::to_value(index.track_boxes(t.id).unwrap_or_default())
+                        .unwrap_or_default();
+                }
+                v
+            })
+            .collect();
+        Json(json!({"from": from, "to": to, "tracks": out})).into_response()
     }
 }

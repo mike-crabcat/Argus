@@ -329,7 +329,7 @@ pub mod http {
     use super::*;
     use crate::http::{AppState, Recordings};
 
-    fn recordings_or_404(st: &AppState) -> Result<&Recordings, Box<Response>> {
+    pub(crate) fn recordings_or_404(st: &AppState) -> Result<&Recordings, Box<Response>> {
         st.recordings.as_ref().ok_or_else(|| {
             Box::new((StatusCode::NOT_FOUND, "replay is not enabled").into_response())
         })
@@ -348,7 +348,7 @@ pub mod http {
         }
     }
 
-    fn int(q: &HashMap<String, String>, k: &str) -> Option<i64> {
+    pub(crate) fn int(q: &HashMap<String, String>, k: &str) -> Option<i64> {
         q.get(k).and_then(|v| v.parse().ok())
     }
 

@@ -183,7 +183,55 @@ async fn run(cfg: Config) -> Result<()> {
     }
     info!(streams = ingest.len(), root = %cfg.storage.root.display(), "recording");
     let live = Arc::new(live);
+    // Stills when an event starts, from the camera's Snap API on a session
+    // of its own: for the camera's events and for Argus's.
+    let mut still_starters: std::collections::HashMap<String, argus_server::detect::OnEvent> =
+        Default::default();
+    let rt = tokio::runtime::Handle::current();
+    for cam in &cfg.cameras {
+        let Some(ev) = cam.reolink_events()? else {
+            continue;
+        };
+        if !ev.stills {
+            continue;
+        }
+        let snaps: Arc<dyn argus_server::stills::StillSource> =
+            Arc::new(argus_server::stills::ReolinkSnaps::new(
+                reolink::Client::new(&ev.base, &ev.user, &ev.password)?,
+            ));
+        let store = argus_server::stills::StillStore::new(&cfg.storage.root);
+        let name = cam.name.clone();
+        let rt = rt.clone();
+        still_starters.insert(
+            cam.name.clone(),
+            Arc::new(move |id| {
+                rt.spawn(argus_server::stills::capture(
+                    store.clone(),
+                    snaps.clone(),
+                    name.clone(),
+                    id,
+                    &argus_server::stills::OFFSETS_MS,
+                ));
+            }),
+        );
+    }
+    let mut detect_events = std::collections::HashSet::new();
     if let Some(d) = &cfg.detect {
+        let mut tracking = argus_server::detect::Tracking::new(index.clone());
+        for c in &cfg.cameras {
+            if d.cameras.is_empty() || d.cameras.contains(&c.name) {
+                let mode = c.detect_mode()?;
+                if mode == argus_server::detect::Mode::Events && d.model.is_some() {
+                    detect_events.insert(c.name.clone());
+                }
+                tracking.camera(
+                    &c.name,
+                    mode,
+                    c.hold(),
+                    still_starters.get(&c.name).cloned(),
+                );
+            }
+        }
         let streams: Vec<_> = cfg
             .cameras
             .iter()
@@ -200,7 +248,7 @@ async fn run(cfg: Config) -> Result<()> {
             None => None,
         };
         argus_server::detect::set_report_every(d.log_seconds);
-        argus_server::detect::spawn(streams, d.fps, model);
+        argus_server::detect::spawn(streams, d.fps, model, tracking);
     }
 
     let mut background = Vec::new();
@@ -342,28 +390,17 @@ async fn run(cfg: Config) -> Result<()> {
         let Some(ev) = cam.reolink_events()? else {
             continue;
         };
+        if detect_events.contains(&cam.name) {
+            info!(camera = %cam.name, "events from Argus's own detection");
+            continue;
+        }
         info!(camera = %cam.name, api = %ev.base, labels = ?ev.labels,
               "events from camera detections");
         let client = reolink::Client::new(&ev.base, &ev.user, &ev.password)?;
         let mut t =
             triggers::ReolinkTriggers::new(&cam.name, client, ev.hold, ev.labels, index.clone());
-        if ev.stills {
-            // Stills from the camera's Snap API, on a session of their own.
-            let snaps: Arc<dyn argus_server::stills::StillSource> =
-                Arc::new(argus_server::stills::ReolinkSnaps::new(
-                    reolink::Client::new(&ev.base, &ev.user, &ev.password)?,
-                ));
-            let store = argus_server::stills::StillStore::new(&cfg.storage.root);
-            let name = cam.name.clone();
-            t = t.on_start(move |id| {
-                tokio::spawn(argus_server::stills::capture(
-                    store.clone(),
-                    snaps.clone(),
-                    name.clone(),
-                    id,
-                    &argus_server::stills::OFFSETS_MS,
-                ));
-            });
+        if let Some(start) = still_starters.get(&cam.name).cloned() {
+            t = t.on_start(move |id| start(id));
         }
         background.push(tokio::spawn(t.run(ev.poll)));
     }
@@ -406,6 +443,11 @@ async fn run(cfg: Config) -> Result<()> {
                         Ok(n) if n > 0 => info!(events = n, "removed old event stills"),
                         Ok(_) => {}
                         Err(e) => warn!("expiring event stills: {e:#}"),
+                    }
+                    // Detection tracks: kept 30 days (they're small).
+                    let month_ago = upload::now_ms() - 30 * 86_400_000;
+                    if let Err(e) = index.expire_tracks(month_ago) {
+                        warn!("expiring detection tracks: {e:#}");
                     }
                     ev
                 })

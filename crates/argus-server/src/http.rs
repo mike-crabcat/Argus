@@ -145,6 +145,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/seek", get(crate::replay::http::seek))
         .route("/api/events", get(crate::replay::http::events))
         .route("/api/events/search", get(crate::search::search))
+        .route("/api/detect/compare", get(crate::detect::http::compare))
+        .route("/api/detect/tracks", get(crate::detect::http::tracks))
         .route("/api/media/{*key}", get(crate::replay::http::media))
         .route("/api/replay", get(crate::replay::http::replay_ws))
         .route("/api/info", get(info))

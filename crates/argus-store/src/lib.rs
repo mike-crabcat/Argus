@@ -12,6 +12,7 @@ pub mod gop_index;
 pub mod index;
 pub mod keys;
 pub mod summaries;
+pub mod tracks;
 pub mod upload;
 pub mod writer;
 
