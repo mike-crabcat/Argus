@@ -120,3 +120,18 @@ Docker image after CI passes and a timer here pulls it. See
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+### Agent (optional)
+
+Argus can use a language model to draw a floor plan from a sketch, photo
+or exported plan, and to make changes you describe ("the garage is 6.2 m
+deep"). Any OpenAI-compatible chat-completions API works (OpenAI,
+OpenRouter, Zhipu GLM, a local server): add an `[agent]` section to
+argus.toml (see argus.example.toml) with the key in a file of its own.
+In the plan editor, **Import from image…** and **Ask** then produce a
+draft over the image; change anything, then **Accept** (one undo step) or
+**Discard**. Nothing is saved until you accept. Only the main token can use
+the agent. Every run is logged in `agent.sqlite` in the storage root
+(prompt, tool calls, tokens, cost), and runs stop at the monthly spending
+cap. `GET /api/agent/status` shows the model and this month's spending.
+

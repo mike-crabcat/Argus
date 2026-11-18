@@ -77,6 +77,11 @@ enum Msg {
     },
     Failed(String),
     Events(Vec<MapEvent>),
+    AgentStatus(serde_json::Value),
+    /// What the agent is doing now (None: idle).
+    AgentBusy(Option<String>),
+    /// An agent's answer: commands, summary, warnings, run.
+    Draft(serde_json::Value),
     Image {
         id: String,
         size: [usize; 2],
@@ -184,6 +189,13 @@ pub struct PlanView {
     /// Event markers drawn last frame: (screen position, index in events).
     markers: Vec<(Pos2, usize)>,
     action: Option<MapAction>,
+    /// `/api/agent/status`, once fetched for the editor.
+    agent: Option<serde_json::Value>,
+    agent_asked: bool,
+    agent_busy: Option<String>,
+    ask_text: String,
+    /// The draft under review: (summary, warnings, cost in USD).
+    draft_info: Option<(String, Vec<String>, f64)>,
 }
 
 fn sp(v: &View, p: Point) -> Pos2 {
@@ -232,6 +244,11 @@ impl PlanView {
             window: 1,
             markers: Vec::new(),
             action: None,
+            agent: None,
+            agent_asked: false,
+            agent_busy: None,
+            ask_text: String::new(),
+            draft_info: None,
         };
         v.load(ctx);
         v
@@ -312,6 +329,9 @@ impl PlanView {
                 Msg::Uploaded { id, w, h } => self.place_background(id, w, h),
                 Msg::Failed(e) => self.note(e),
                 Msg::Events(e) => self.events = e,
+                Msg::AgentStatus(v) => self.agent = Some(v),
+                Msg::AgentBusy(b) => self.agent_busy = b,
+                Msg::Draft(v) => self.take_draft(v),
                 Msg::Image {
                     id,
                     size,
@@ -506,6 +526,14 @@ impl PlanView {
             "chain": self.chain.is_some(),
             "typed": self.typed,
             "images": { "loaded": self.bgs.len(), "loading": self.bg_loading.len() },
+            "agent": {
+                "status": self.agent,
+                "busy": self.agent_busy,
+                "draft": self.draft_info.as_ref().map(|(s, w, c)| serde_json::json!({
+                    "summary": s, "warnings": w, "cost_usd": c,
+                    "new_entities": self.doc.as_ref().map_or(0, |d| d.draft_ids().len()),
+                })),
+            },
             "buttons": BUTTONS.with(|b| b.borrow().clone()),
             "events": self.events.len(),
             "markers": self.markers.iter().map(|(p, i)| serde_json::json!({
@@ -550,6 +578,10 @@ impl PlanView {
             self.camera_pick = cameras.first().cloned().unwrap_or_default();
         }
         self.ensure_bg(&ctx);
+        if self.editing && !self.agent_asked {
+            self.agent_asked = true;
+            self.fetch_agent_status(&ctx);
+        }
 
         let p = ui.painter_at(rect);
         p.rect_filled(rect, CornerRadius::ZERO, BG);
@@ -586,6 +618,9 @@ impl PlanView {
         self.bar_ui(ui, bar, admin && wide);
         if let Some(r) = props {
             self.props_ui(ui, r, cameras);
+        }
+        if self.editing {
+            self.draft_bar(ui, canvas);
         }
         if let Some((msg, until)) = self.note.clone() {
             if now_ms() > until {
@@ -1055,7 +1090,10 @@ impl PlanView {
             } else {
                 None
             };
-            draw_level(&p, &view, l, &self.sel, hover, self.editing);
+            let drafted = self.doc.as_ref().map(|d| d.draft_ids()).unwrap_or_default();
+            let mut hot = self.sel.clone();
+            hot.extend(drafted);
+            draw_level(&p, &view, l, &hot, hover, self.editing);
         }
         if !self.editing
             && let Some(l) = &level
@@ -1830,6 +1868,307 @@ impl PlanView {
         }
     }
 
+    fn fetch_agent_status(&mut self, ctx: &egui::Context) {
+        let (inbox, token, ctx) = (self.inbox.clone(), self.token.clone(), ctx.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok((200, body)) =
+                send("GET", "/api/agent/status", None, None, token.as_deref()).await
+                && let Ok(v) = serde_json::from_str(&body)
+            {
+                inbox.borrow_mut().push(Msg::AgentStatus(v));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Sends a request to an agent endpoint; the answer becomes a draft.
+    fn agent_request(
+        inbox: Rc<RefCell<Vec<Msg>>>,
+        token: Option<String>,
+        ctx: egui::Context,
+        path: &'static str,
+        body: serde_json::Value,
+    ) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let r = send(
+                "POST",
+                path,
+                Some(&wasm_bindgen::JsValue::from_str(&body.to_string())),
+                Some("application/json"),
+                token.as_deref(),
+            )
+            .await;
+            let msg = match r {
+                Ok((200, b)) => match serde_json::from_str(&b) {
+                    Ok(v) => Msg::Draft(v),
+                    Err(e) => Msg::Failed(format!("The agent's answer didn't parse: {e}")),
+                },
+                Ok((code, b)) => Msg::Failed(
+                    serde_json::from_str::<serde_json::Value>(&b)
+                        .ok()
+                        .and_then(|v| v["error"].as_str().map(String::from))
+                        .unwrap_or_else(|| format!("The agent failed (HTTP {code}).")),
+                ),
+                Err(e) => Msg::Failed(e),
+            };
+            let mut q = inbox.borrow_mut();
+            q.push(Msg::AgentBusy(None));
+            q.push(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    fn agent_import(&mut self, ctx: &egui::Context) {
+        let (inbox, token, ctx) = (self.inbox.clone(), self.token.clone(), ctx.clone());
+        let level = self.level_id().0;
+        pick_image(move |file| {
+            let (inbox, token, ctx) = (inbox.clone(), token.clone(), ctx.clone());
+            inbox
+                .borrow_mut()
+                .push(Msg::AgentBusy(Some("Uploading the image…".into())));
+            wasm_bindgen_futures::spawn_local(async move {
+                let ct = file.type_();
+                let r = send(
+                    "POST",
+                    "/api/plan/assets",
+                    Some(&file.into()),
+                    Some(if ct.is_empty() {
+                        "application/octet-stream"
+                    } else {
+                        &ct
+                    }),
+                    token.as_deref(),
+                )
+                .await;
+                let asset = match r {
+                    Ok((201, b)) => serde_json::from_str::<serde_json::Value>(&b)
+                        .ok()
+                        .and_then(|v| v["id"].as_str().map(String::from)),
+                    _ => None,
+                };
+                let Some(asset) = asset else {
+                    let mut q = inbox.borrow_mut();
+                    q.push(Msg::AgentBusy(None));
+                    q.push(Msg::Failed(
+                        "The image didn't upload (PNG or JPEG, at most 20 MB).".into(),
+                    ));
+                    ctx.request_repaint();
+                    return;
+                };
+                inbox.borrow_mut().push(Msg::AgentBusy(Some(
+                    "The agent is reading the image…".into(),
+                )));
+                ctx.request_repaint();
+                Self::agent_request(
+                    inbox,
+                    token,
+                    ctx,
+                    "/api/plan/import",
+                    serde_json::json!({ "asset": asset, "level": level }),
+                );
+            });
+        });
+    }
+
+    fn agent_ask(&mut self, ctx: &egui::Context) {
+        let text = self.ask_text.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        self.agent_busy = Some("The agent is working on it…".into());
+        Self::agent_request(
+            self.inbox.clone(),
+            self.token.clone(),
+            ctx.clone(),
+            "/api/plan/ask",
+            serde_json::json!({ "text": text, "level": self.level_id().0 }),
+        );
+    }
+
+    /// An agent's batch arrives: apply it as a draft for review.
+    fn take_draft(&mut self, v: serde_json::Value) {
+        let cmds: Vec<Command> = match serde_json::from_value(v["commands"].clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.note(format!("The agent's commands didn't parse: {e}"));
+                return;
+            }
+        };
+        let Some(d) = &mut self.doc else { return };
+        match d.begin_draft(cmds) {
+            Ok(()) => {
+                let warnings = v["warnings"]
+                    .as_array()
+                    .map(|w| {
+                        w.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.draft_info = Some((
+                    v["summary"].as_str().unwrap_or("").to_owned(),
+                    warnings,
+                    v["run"]["cost_usd"].as_f64().unwrap_or(0.0),
+                ));
+                self.ask_text.clear();
+                self.sel.clear();
+                self.view = None;
+                self.agent_asked = false; // refresh the spend shown
+            }
+            Err(e) => self.note(format!(
+                "The draft doesn't fit the plan as it is here ({e}). Reload and try again."
+            )),
+        }
+    }
+
+    /// The bar over a draft: what the agent did, Discard and Accept.
+    fn draft_bar(&mut self, ui: &mut egui::Ui, canvas: Rect) {
+        let Some((summary, warnings, cost)) = self.draft_info.clone() else {
+            return;
+        };
+        let p = ui.painter().clone();
+        let r = Rect::from_min_size(
+            pos2(canvas.left() + 16.0, canvas.top() + 12.0),
+            vec2(
+                (canvas.width() - 32.0).min(760.0),
+                64.0 + 18.0 * warnings.len().min(3) as f32,
+            ),
+        );
+        p.rect_filled(r, CornerRadius::same(theme::TILE_RADIUS), SURFACE);
+        p.rect_stroke(
+            r,
+            CornerRadius::same(theme::TILE_RADIUS),
+            Stroke::new(1.0, ACCENT),
+            StrokeKind::Inside,
+        );
+        let n = self.doc.as_ref().map_or(0, |d| d.draft_ids().len());
+        p.text(
+            r.min + vec2(16.0, 18.0),
+            Align2::LEFT_CENTER,
+            format!("Draft from the agent · {n} new items · ${cost:.2}"),
+            theme::semibold(13.5),
+            ACCENT,
+        );
+        let g = p.layout(summary, theme::regular(12.5), TEXT_2, r.width() - 230.0);
+        p.galley(r.min + vec2(16.0, 30.0), g, TEXT_2);
+        for (i, w) in warnings.iter().take(3).enumerate() {
+            p.text(
+                r.min + vec2(16.0, 58.0 + 18.0 * i as f32),
+                Align2::LEFT_CENTER,
+                format!("⚠ {w}"),
+                theme::regular(12.0),
+                ALERT,
+            );
+        }
+        let id = ui.scope_id().with("draftbar");
+        let mut rx = r.right() - 14.0;
+        let mut button = |ui: &mut egui::Ui, label: &str, on: bool| {
+            let g = p.layout_no_wrap(label.into(), theme::regular(12.5), TEXT);
+            let b = Rect::from_min_size(
+                pos2(rx - g.size().x - 24.0, r.top() + 10.0),
+                vec2(g.size().x + 24.0, 26.0),
+            );
+            rx = b.left() - 6.0;
+            draw_pill(ui, &p, b, label, on, id.with(label)).clicked()
+        };
+        if button(ui, "Accept", true) {
+            if let Some(d) = &mut self.doc {
+                d.accept_draft();
+            }
+            self.draft_info = None;
+            self.last_edit_ms = now_ms();
+            self.note("Accepted. Ctrl+Z undoes it as one step.");
+        }
+        if button(ui, "Discard", false) {
+            if let Some(d) = &mut self.doc {
+                d.discard_draft();
+            }
+            self.draft_info = None;
+            self.sel.clear();
+            self.view = None;
+            self.note("Draft discarded.");
+        }
+    }
+
+    fn agent_props(&mut self, ui: &mut egui::Ui) {
+        heading(ui, "Agent");
+        let Some(st) = self.agent.clone() else {
+            hint(ui, "Checking for a model…");
+            return;
+        };
+        if st["configured"] != true {
+            let msg = st["message"]
+                .as_str()
+                .unwrap_or("Set up a model in argus.toml ([agent] section).");
+            ui.label(
+                egui::RichText::new(msg)
+                    .font(theme::regular(12.5))
+                    .color(ALERT),
+            );
+            return;
+        }
+        if let Some(b) = &self.agent_busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                hint(ui, b);
+            });
+            return;
+        }
+        if self.draft_info.is_some() {
+            hint(
+                ui,
+                "Review the draft: change anything first if you like, then Accept or Discard (top left).",
+            );
+            return;
+        }
+        if self.doc.as_ref().is_some_and(|d| d.dirty()) {
+            hint(ui, "Saving your edits first…");
+            return;
+        }
+        hint(
+            ui,
+            "Draw this level from a sketch, photo or exported plan. The agent drafts it; you review it before anything is saved.",
+        );
+        if btn(ui, "Import from image…").clicked() {
+            self.agent_import(ui.ctx());
+        }
+        ui.add_space(4.0);
+        let ed = ui.add(
+            egui::TextEdit::multiline(&mut self.ask_text)
+                .hint_text("Ask the agent to change the plan, e.g. \"the garage is 6.2 m deep\"")
+                .desired_rows(2)
+                .desired_width(ui.available_width()),
+        );
+        BUTTONS.with(|b| {
+            b.borrow_mut().push((
+                "ask-box".into(),
+                [
+                    ed.rect.min.x,
+                    ed.rect.min.y,
+                    ed.rect.width(),
+                    ed.rect.height(),
+                ],
+            ))
+        });
+        let enter =
+            ed.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+        if (btn(ui, "Ask").clicked() || enter) && !self.ask_text.trim().is_empty() {
+            self.agent_ask(ui.ctx());
+        }
+        if let (Some(spent), Some(cap)) = (
+            st["month_spend_usd"].as_f64(),
+            st["monthly_cap_usd"].as_f64(),
+        ) {
+            hint(
+                ui,
+                &format!(
+                    "{} · ${spent:.2} of ${cap:.2} this month",
+                    st["model"].as_str().unwrap_or("")
+                ),
+            );
+        }
+    }
+
     fn level_props(&mut self, ui: &mut egui::Ui) {
         let Some(l) = self.level().cloned() else {
             return;
@@ -1900,6 +2239,8 @@ impl PlanView {
                 });
             }
         }
+        ui.add_space(8.0);
+        self.agent_props(ui);
         ui.add_space(8.0);
         hint(
             ui,
@@ -2295,6 +2636,9 @@ pub fn draw_level(
         if let Some(poly) = argus_plan::rooms::room_polygon(l, r) {
             let c = if hot(r.id) {
                 ACCENT.gamma_multiply(0.10)
+            } else if l.background.is_some() {
+                // Let a traced image show through.
+                ROOM.gamma_multiply(0.45)
             } else {
                 ROOM
             };
