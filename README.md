@@ -135,3 +135,21 @@ the agent. Every run is logged in `agent.sqlite` in the storage root
 (prompt, tool calls, tokens, cost), and runs stop at the monthly spending
 cap. `GET /api/agent/status` shows the model and this month's spending.
 
+### Event stills, summaries and search
+
+When a Reolink camera reports a detection, Argus takes three snapshots
+(at the start, +2 s and +5 s) with the camera's Snap API and keeps them in
+`events/` in the storage root, until the event's recording leaves local
+disk. With an `[agent]` configured, a background worker sends each
+finished event's stills to the model, with the camera's place on the floor
+plan, and stores a one-line summary, the objects seen and whether it looks
+notable. At most one summary per camera per `summary_gap_seconds` (events
+in between are merged); the monthly cap pauses it. A camera opts out with
+`summarize = false` under `[camera.events]`.
+
+The search box in the top bar (Search on phones) finds events by their
+summary, label or camera; click one to replay it. With a model set up, it
+can also read the question first ("anyone at the back gate last night").
+The API is `GET /api/events/search?q=...`, and stills are served at
+`/api/media/events/{id}/{n}.jpg`.
+

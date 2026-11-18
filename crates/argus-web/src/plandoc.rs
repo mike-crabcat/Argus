@@ -361,6 +361,10 @@ pub fn find(p: &Plan, id: Id) -> Option<(Id, Entity)> {
 /// An event as `/api/events` lists it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct MapEvent {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub summary: Option<String>,
     pub camera: String,
     pub start_ms: i64,
     pub end_ms: i64,

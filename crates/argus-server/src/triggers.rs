@@ -113,6 +113,8 @@ pub struct ReolinkTriggers {
     labels: Vec<String>,
     index: Arc<Mutex<Index>>,
     event_ids: BTreeMap<&'static str, i64>,
+    /// Called with each new event's id (to take stills).
+    on_start: Option<Box<dyn Fn(i64) + Send>>,
 }
 
 impl ReolinkTriggers {
@@ -130,7 +132,14 @@ impl ReolinkTriggers {
             labels,
             index,
             event_ids: BTreeMap::new(),
+            on_start: None,
         }
+    }
+
+    /// Runs `f` with the id of every event as it starts.
+    pub fn on_start(mut self, f: impl Fn(i64) + Send + 'static) -> Self {
+        self.on_start = Some(Box::new(f));
+        self
     }
 
     /// One poll at `now_ms`; returns the changes it made.
@@ -154,6 +163,9 @@ impl ReolinkTriggers {
                     let id = index.add_event(&self.camera, at_ms, at_ms, "reolink", label)?;
                     self.event_ids.insert(label, id);
                     info!(camera = %self.camera, label, "event started");
+                    if let Some(f) = &self.on_start {
+                        f(id);
+                    }
                 }
                 Change::Extend { label, to_ms } => {
                     if let Some(&id) = self.event_ids.get(label) {
