@@ -8,6 +8,7 @@
 //!
 //! No UI here: this crate builds for native and wasm alike.
 
+pub mod calib;
 pub mod command;
 pub mod context;
 pub mod fixture;

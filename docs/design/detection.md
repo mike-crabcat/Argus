@@ -74,3 +74,27 @@ fps = 5          # pictures a second to look at, per camera
 stream = "sub"   # which stream to decode (H.264)
 cameras = []     # empty: all
 ```
+
+## Positions on the plan
+
+A camera is calibrated in the plan editor: select it, choose
+"Calibrate…", and click spots on the ground in its picture (a snapshot
+from the camera, or its latest event still) and the same spots on the
+plan, four or more. The fit is a homography (normalised DLT; from six
+pairs, RANSAC sets aside a mis-click), from picture fractions to plan mm,
+so one calibration serves the main stream's snapshots and the sub
+stream's detections. The editor shows each pair's error in mm and the
+plan's metre grid drawn over the picture; saving is a `set_calibration`
+command, undoable like any edit.
+
+Each track box's foot point (or the bottom centre of its box) is then
+mapped onto the plan, smoothed along the track, and stored with the box
+(`plan_x`, `plan_y`, and the track's `level`). Points outside the
+camera's field of view (10° to spare) or beyond 1.5 times its range are
+dropped. The map draws the window's tracks as fading paths with a dot at
+the latest position, coloured by label; tapping a path replays it from
+its start; "Live" shows only what is moving now, polled every second.
+
+API: `/api/detect/tracks` includes positions; `POST /api/plan/calibrate`
+previews a fit without saving; `GET /api/cameras/{name}/snapshot` is the
+camera's picture now.

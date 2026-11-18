@@ -67,6 +67,11 @@ impl PlanStore {
         self.current.lock().unwrap().clone()
     }
 
+    /// The plan's version, without copying the plan.
+    pub fn version(&self) -> u64 {
+        self.current.lock().unwrap().version
+    }
+
     fn save(&self, v: &Versioned) -> Result<()> {
         let tmp = self.path.with_extension("json.partial");
         std::fs::write(&tmp, serde_json::to_vec_pretty(v)?)?;

@@ -228,6 +228,43 @@ pub fn demo_house() -> Plan {
     p
 }
 
+/// Calibrates every camera of a plan as an ideal camera of its placement
+/// would see (4:3 pictures), with `set_calibration` commands: for tests
+/// and demos of positions on the map.
+pub fn calibrate_ideal(p: &mut Plan) -> Result<(), crate::PlanError> {
+    let picks = [
+        [0.15, 0.6],
+        [0.85, 0.6],
+        [0.1, 0.95],
+        [0.9, 0.95],
+        [0.5, 0.75],
+    ];
+    let mut cmds = Vec::new();
+    for l in &p.levels {
+        for c in &l.cameras {
+            let Some(h) = crate::calib::pinhole(c, 4.0 / 3.0) else {
+                continue;
+            };
+            let pairs = picks
+                .iter()
+                .filter_map(|&i| {
+                    crate::calib::project(&h, i)
+                        .map(|plan| crate::calib::CalPair { image: i, plan })
+                })
+                .collect();
+            cmds.push(Command::SetCalibration {
+                level: l.id,
+                camera: c.id,
+                pairs: Some(pairs),
+            });
+        }
+    }
+    for c in cmds {
+        p.apply(&c)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

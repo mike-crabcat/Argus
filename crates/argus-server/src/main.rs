@@ -183,6 +183,10 @@ async fn run(cfg: Config) -> Result<()> {
     }
     info!(streams = ingest.len(), root = %cfg.storage.root.display(), "recording");
     let live = Arc::new(live);
+    // The floor plan: served over HTTP, and where detections are placed.
+    let plan_store = Some(Arc::new(argus_server::plan::PlanStore::open(
+        &cfg.storage.root,
+    )?));
     // Stills when an event starts, from the camera's Snap API on a session
     // of its own: for the camera's events and for Argus's.
     let mut still_starters: std::collections::HashMap<String, argus_server::detect::OnEvent> =
@@ -215,9 +219,24 @@ async fn run(cfg: Config) -> Result<()> {
             }),
         );
     }
+    // Snapshots on request (calibration), on a session of their own.
+    let mut snapshots: std::collections::HashMap<
+        String,
+        Arc<dyn argus_server::stills::StillSource>,
+    > = Default::default();
+    for cam in &cfg.cameras {
+        if let Some(ev) = cam.reolink_events()? {
+            snapshots.insert(
+                cam.name.clone(),
+                Arc::new(argus_server::stills::ReolinkSnaps::new(
+                    reolink::Client::new(&ev.base, &ev.user, &ev.password)?,
+                )),
+            );
+        }
+    }
     let mut detect_events = std::collections::HashSet::new();
     if let Some(d) = &cfg.detect {
-        let mut tracking = argus_server::detect::Tracking::new(index.clone());
+        let mut tracking = argus_server::detect::Tracking::new(index.clone(), plan_store.clone());
         for c in &cfg.cameras {
             if d.cameras.is_empty() || d.cameras.contains(&c.name) {
                 let mode = c.detect_mode()?;
@@ -304,14 +323,13 @@ async fn run(cfg: Config) -> Result<()> {
                 },
             }),
             devices: Some(devices),
-            plan: Some(Arc::new(argus_server::plan::PlanStore::open(
-                &cfg.storage.root,
-            )?)),
+            plan: plan_store.clone(),
             agent: cfg
                 .agent
                 .as_ref()
                 .map(|a| Arc::new(argus_server::agent::AgentHandle::new(a, &cfg.storage.root))),
             alerts: Some(alerts.clone()),
+            snapshots: Some(Arc::new(snapshots.clone())),
             public_url: h
                 .public_url
                 .as_deref()

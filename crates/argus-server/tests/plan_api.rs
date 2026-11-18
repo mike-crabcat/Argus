@@ -33,6 +33,7 @@ async fn server() -> Server {
         plan: Some(Arc::new(PlanStore::open(dir.path()).unwrap())),
         agent: None,
         alerts: None,
+        snapshots: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -218,4 +219,84 @@ async fn background_images() {
         .await
         .unwrap();
     assert_eq!(r.status(), 401);
+}
+
+#[tokio::test]
+async fn calibration_preview_and_saving() {
+    use argus_plan::calib::{CalPair, pinhole, project};
+    let s = server().await;
+    // A preview: the fit, nothing saved.
+    let mut plan = argus_plan::fixture::demo_house();
+    let cam = plan.levels[0].cameras[0].clone();
+    let h = pinhole(&cam, 4.0 / 3.0).unwrap();
+    let pairs: Vec<CalPair> = [
+        [0.2, 0.6],
+        [0.8, 0.6],
+        [0.1, 0.95],
+        [0.9, 0.95],
+        [0.5, 0.75],
+    ]
+    .iter()
+    .map(|&i| CalPair {
+        image: i,
+        plan: project(&h, i).unwrap(),
+    })
+    .collect();
+    let r = s
+        .req(reqwest::Method::POST, "/api/plan/calibrate", &s.phone)
+        .json(&json!({ "pairs": pairs }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let fit: Value = r.json().await.unwrap();
+    assert!(fit["rms_mm"].as_f64().unwrap() < 1.0);
+    assert_eq!(fit["errors"].as_array().unwrap().len(), 5);
+    let r = s
+        .req(reqwest::Method::POST, "/api/plan/calibrate", TOKEN)
+        .json(&json!({ "pairs": &pairs[..3] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("at least 4"));
+    // Saving is a plan command: the main token only.
+    let v = s.plan(TOKEN).await;
+    plan.next_id = plan.next_id.max(v.plan.next_id);
+    let r = s
+        .req(reqwest::Method::PUT, "/api/plan", TOKEN)
+        .json(&json!({"version": v.version, "plan": plan}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v = s.plan(TOKEN).await;
+    let cmd = Command::SetCalibration {
+        level: v.plan.levels[0].id,
+        camera: cam.id,
+        pairs: Some(pairs),
+    };
+    assert_eq!(
+        s.commands(&s.phone, json!({"commands": [cmd]}))
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        s.commands(TOKEN, json!({"commands": [cmd]})).await.status(),
+        200
+    );
+    let v = s.plan(&s.phone).await;
+    assert!(v.plan.levels[0].cameras[0].calibration.is_some());
+    // No snapshot source here: 404, not a hang.
+    let r = s
+        .req(
+            reqwest::Method::GET,
+            "/api/cameras/doorbell/snapshot",
+            TOKEN,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
 }
