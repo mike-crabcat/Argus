@@ -15,6 +15,7 @@ argus-store = { path = "crates/argus-store" }
 argus-ingest = { path = "crates/argus-ingest" }
 argus-proto = { path = "crates/argus-proto" }
 argus-plan = { path = "crates/argus-plan" }
+argus-agent = { path = "crates/argus-agent" }
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 bytes = "1"
