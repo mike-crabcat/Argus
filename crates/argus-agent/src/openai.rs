@@ -65,7 +65,9 @@ impl OpenAiCompat {
             body["max_tokens"] = m.into();
         }
         if let Some(t) = req.temperature {
-            body["temperature"] = t.into();
+            // As written (0.2, not f32's 0.20000000298...): some providers
+            // (Z.AI's GLM) refuse more than two decimals.
+            body["temperature"] = (((t as f64) * 100.0).round() / 100.0).into();
         }
         body
     }
@@ -114,8 +116,20 @@ fn message_json(m: &Message) -> Value {
 /// Parses a chat-completions answer.
 pub fn parse_response(v: &Value) -> Result<ChatResponse, AgentError> {
     if let Some(e) = v.get("error") {
-        let msg = e["message"].as_str().unwrap_or("unknown error");
-        return Err(AgentError::Provider(msg.chars().take(300).collect()));
+        let mut msg = e["message"].as_str().unwrap_or("unknown error").to_owned();
+        // OpenRouter wraps the upstream provider's error; its own message
+        // ("Provider returned error") says little, so add the provider's.
+        if let Some(raw) = e["metadata"]["raw"].as_str() {
+            let inner = serde_json::from_str::<Value>(raw)
+                .ok()
+                .and_then(|r| r["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| raw.to_owned());
+            let who = e["metadata"]["provider_name"]
+                .as_str()
+                .unwrap_or("provider");
+            msg = format!("{msg} ({who}: {inner})");
+        }
+        return Err(AgentError::Provider(msg.chars().take(400).collect()));
     }
     let m = &v["choices"][0]["message"];
     if m.is_null() {

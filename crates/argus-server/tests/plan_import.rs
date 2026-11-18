@@ -275,3 +275,35 @@ async fn the_spending_cap_stops_an_import() {
     assert_eq!(s.mock.as_ref().unwrap().calls(), 1);
     assert_eq!(s.plan().await.version, 0);
 }
+
+/// Batches like the ones models write (consecutive wall ids, openings
+/// referring to them) pass the check in one go.
+#[test]
+fn consecutive_wall_ids_pass_the_check() {
+    use argus_plan::{Command, End, Id, OpeningKind, Plan, pt};
+    let p = Plan::default();
+    let lv = p.levels[0].id;
+    let w = |id: u64, a: (f64, f64), b: (f64, f64)| Command::AddWall {
+        level: lv,
+        id: Some(Id(id)),
+        a: End::At(pt(a.0, a.1)),
+        b: End::At(pt(b.0, b.1)),
+        thickness: 230.0,
+    };
+    let batch = vec![
+        w(2, (0.0, 0.0), (4000.0, 0.0)),
+        w(3, (4000.0, 0.0), (4000.0, 3000.0)),
+        w(4, (4000.0, 3000.0), (0.0, 3000.0)),
+        Command::AddOpening {
+            level: lv,
+            id: Some(Id(5)),
+            wall: Id(4),
+            kind: OpeningKind::Door,
+            offset: 2000.0,
+            width: 820.0,
+            swing: None,
+        },
+    ];
+    let done = argus_server::plan_agent::check_batch(&p, &batch).unwrap();
+    assert_eq!(done.levels[0].walls.len(), 3);
+}

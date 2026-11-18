@@ -76,17 +76,19 @@ fn submit_schema(with_scale: bool) -> Value {
 
 /// Applies `cmds` to a copy of `plan`; the reason for the first refusal.
 pub fn check_batch(plan: &Plan, cmds: &[Command]) -> Result<Plan, String> {
+    // As one batch, as the editor and /api/plan/commands will apply it
+    // (the batch's own ids are reserved throughout).
     let mut draft = plan.clone();
-    for (i, c) in cmds.iter().enumerate() {
-        if let Err(e) = draft.apply(c) {
-            let op = serde_json::to_value(c)
+    match draft.apply_all_checked(cmds) {
+        Ok(_) => Ok(draft),
+        Err((i, e)) => {
+            let op = serde_json::to_value(&cmds[i])
                 .ok()
                 .and_then(|v| v["op"].as_str().map(String::from))
                 .unwrap_or_default();
-            return Err(format!("command {i} ({op}) was refused: {e}"));
+            Err(format!("command {i} ({op}) was refused: {e}"))
         }
     }
-    Ok(draft)
 }
 
 /// Parses the tool's commands, naming any that don't fit the schema.

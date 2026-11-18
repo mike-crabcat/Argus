@@ -24,6 +24,11 @@ pub struct Plan {
     pub levels: Vec<Level>,
     /// The next id to hand out. Ids only ever increase.
     pub next_id: u64,
+    /// While a batch is applied: ids it gives explicitly, which implicit
+    /// numbering (wall ends, split walls) skips. Empty otherwise.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) reserved: Vec<u64>,
 }
 
 impl Default for Plan {
@@ -32,6 +37,7 @@ impl Default for Plan {
         let mut p = Plan {
             levels: Vec::new(),
             next_id: 1,
+            reserved: Vec::new(),
         };
         let id = p.alloc();
         p.levels.push(Level::new(id, "Ground"));
@@ -205,7 +211,22 @@ impl Entity {
 }
 
 impl Plan {
+    /// A plan with no levels, handing out ids from `next_id`.
+    pub fn empty(next_id: u64) -> Self {
+        Plan {
+            levels: Vec::new(),
+            next_id,
+            reserved: Vec::new(),
+        }
+    }
+
     pub(crate) fn alloc(&mut self) -> Id {
+        // Skip ids the batch being applied gives explicitly, so a batch
+        // can name its walls 2, 3, 4... although each wall's ends are
+        // numbered as it is added.
+        while self.reserved.contains(&self.next_id) {
+            self.next_id += 1;
+        }
         let id = Id(self.next_id);
         self.next_id += 1;
         id
