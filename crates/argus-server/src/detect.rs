@@ -249,12 +249,17 @@ pub fn run_model(
 fn sender(
     camera: &str,
     tx: Option<SyncSender<(Arc<str>, Prepared)>>,
+    keep_picture: bool,
 ) -> impl FnMut(Picture) + use<> {
     let camera: Arc<str> = camera.into();
     let mut dropped = 0u64;
     move |p| {
         let Some(tx) = &tx else { return };
-        if let Err(TrySendError::Full(_)) = tx.try_send((camera.clone(), Prepared::new(&p))) {
+        let mut prepared = Prepared::new(&p);
+        if keep_picture {
+            prepared.picture = Some(p);
+        }
+        if let Err(TrySendError::Full(_)) = tx.try_send((camera.clone(), prepared)) {
             dropped += 1;
             if dropped.is_power_of_two() {
                 warn!(%camera, dropped, "detection: the model is behind; pictures dropped");
@@ -340,6 +345,7 @@ impl Tracking {
                 class: d.class,
                 score: d.score,
                 bbox: d.bbox,
+                foot: d.foot.map(|f| [f.x, f.y]),
             })
             .collect();
         let changes = c.tracker.update(f.wall_us, &seen);
@@ -419,6 +425,7 @@ fn tbox(t: &argus_detect::track::Track) -> TrackBox {
         t_ms: ms(t.last_us),
         bbox: t.bbox,
         score: t.best_score,
+        foot: t.foot,
     }
 }
 
@@ -441,6 +448,36 @@ pub struct ModelSpec {
     pub path: std::path::PathBuf,
     pub device: argus_detect::model::Device,
     pub threshold: f32,
+    /// The pose model, for people's foot points.
+    pub pose: Option<std::path::PathBuf>,
+}
+
+/// Adds foot points to the people found in each picture. If the pose
+/// model fails, people keep the bottom centre of their box.
+fn add_feet(
+    pose: &mut argus_detect::pose::PoseModel,
+    pictures: &[&Prepared],
+    found: &mut [Vec<Detection>],
+) {
+    for (p, dets) in pictures.iter().zip(found.iter_mut()) {
+        let people: Vec<usize> = (0..dets.len())
+            .filter(|&i| dets[i].label == "person")
+            .collect();
+        if people.is_empty() {
+            continue;
+        }
+        let boxes: Vec<_> = people.iter().map(|&i| dets[i].bbox).collect();
+        let feet = match &p.picture {
+            Some(pic) => pose.feet(pic, &boxes).unwrap_or_else(|e| {
+                warn!("pose model: {e}");
+                boxes.iter().map(argus_detect::pose::box_foot).collect()
+            }),
+            None => boxes.iter().map(argus_detect::pose::box_foot).collect(),
+        };
+        for (&i, f) in people.iter().zip(feet) {
+            dets[i].foot = Some(f);
+        }
+    }
 }
 
 /// Starts a decoding thread for each stream and, with a model, the thread
@@ -451,6 +488,7 @@ pub fn spawn(
     model: Option<ModelSpec>,
     mut tracking: Tracking,
 ) {
+    let keep_pictures = model.as_ref().is_some_and(|m| m.pose.is_some());
     let tx = model.map(|spec| {
         let (tx, rx) = std::sync::mpsc::sync_channel(2 * MAX_BATCH);
         let r = std::thread::Builder::new()
@@ -467,9 +505,27 @@ pub fn spawn(
                 m.threshold = spec.threshold;
                 info!(device = ?spec.device, secs = format!("{:.1}", t.elapsed().as_secs_f64()),
                     "detection model loaded");
+                let mut pose = spec.pose.as_ref().and_then(|path| {
+                    match argus_detect::pose::PoseModel::open(path, spec.device) {
+                        Ok(p) => {
+                            info!("pose model loaded");
+                            Some(p)
+                        }
+                        Err(e) => {
+                            warn!(model = %path.display(), "pose model didn't load: {e}");
+                            None
+                        }
+                    }
+                });
                 run_model(
                     rx,
-                    |p| m.detect_prepared(p).map_err(|e| e.to_string()),
+                    |p| {
+                        let mut found = m.detect_prepared(p).map_err(|e| e.to_string())?;
+                        if let Some(pose) = &mut pose {
+                            add_feet(pose, p, &mut found);
+                        }
+                        Ok(found)
+                    },
                     |f| tracking.feed(&f),
                 );
             });
@@ -480,7 +536,7 @@ pub fn spawn(
     });
     for s in streams {
         let name = format!("detect-{}", s.camera);
-        let sink = sender(&s.camera, tx.clone());
+        let sink = sender(&s.camera, tx.clone(), keep_pictures);
         let r = std::thread::Builder::new().name(name).spawn(move || {
             run(&s, fps, sink);
         });
@@ -548,6 +604,7 @@ mod tests {
     fn the_model_thread_batches_and_counts() {
         let (tx, rx) = std::sync::mpsc::sync_channel(2 * MAX_BATCH);
         let pic = |t: i64| Prepared {
+            picture: None,
             data: Vec::new(),
             width: 100,
             height: 100,
@@ -577,6 +634,7 @@ mod tests {
                             class: "person",
                             score: 0.9,
                             bbox: [1.0, 2.0, 3.0, 4.0],
+                            foot: None,
                         }];
                         if p.wall_us % 2 == 1 {
                             v.push(Detection {
@@ -584,6 +642,7 @@ mod tests {
                                 class: "dog",
                                 score: 0.7,
                                 bbox: [0.0; 4],
+                                foot: None,
                             });
                         }
                         v
@@ -611,7 +670,7 @@ mod tests {
     #[test]
     fn a_full_queue_drops_pictures() {
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
-        let mut send = sender("door", Some(tx));
+        let mut send = sender("door", Some(tx), false);
         for t in 0..5 {
             send(Picture {
                 width: 1,
@@ -645,6 +704,11 @@ mod tests {
                     class: "person",
                     score: 0.9,
                     bbox: [x, 200.0, x + 50.0, 320.0],
+                    foot: Some(argus_detect::pose::Foot {
+                        x: x + 25.0,
+                        y: 318.0,
+                        ankles: true,
+                    }),
                 }]
             } else {
                 Vec::new()
@@ -705,6 +769,12 @@ mod tests {
             boxes.iter().map(|b| b.t_ms - t0).collect::<Vec<_>>()
         );
         assert_eq!(boxes.last().unwrap().t_ms, door.end_ms);
+        let last = boxes.last().unwrap();
+        assert_eq!(
+            last.foot,
+            Some([last.bbox[0] + 25.0, 318.0]),
+            "foot points kept"
+        );
     }
 }
 

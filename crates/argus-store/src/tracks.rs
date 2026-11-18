@@ -57,6 +57,8 @@ pub struct TrackBox {
     pub t_ms: i64,
     pub bbox: [f32; 4],
     pub score: f32,
+    /// Where it stood (people), from the pose model.
+    pub foot: Option<[f32; 2]>,
 }
 
 /// One camera's events and tracks over a window, and how many of each
@@ -113,12 +115,20 @@ impl Index {
         )?;
         {
             let mut st = tx.prepare_cached(
-                "INSERT INTO track_box (track_id, t_ms, x1, y1, x2, y2, score)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO track_box (track_id, t_ms, x1, y1, x2, y2, score, foot_x, foot_y)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for b in boxes {
                 st.execute(params![
-                    id, b.t_ms, b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3], b.score
+                    id,
+                    b.t_ms,
+                    b.bbox[0],
+                    b.bbox[1],
+                    b.bbox[2],
+                    b.bbox[3],
+                    b.score,
+                    b.foot.map(|f| f[0]),
+                    b.foot.map(|f| f[1]),
                 ])?;
             }
         }
@@ -154,7 +164,8 @@ impl Index {
 
     pub fn track_boxes(&self, id: i64) -> Result<Vec<TrackBox>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT t_ms, x1, y1, x2, y2, score FROM track_box WHERE track_id = ?1 ORDER BY t_ms",
+            "SELECT t_ms, x1, y1, x2, y2, score, foot_x, foot_y FROM track_box
+              WHERE track_id = ?1 ORDER BY t_ms",
         )?;
         let rows = st
             .query_map([id], |r| {
@@ -162,6 +173,10 @@ impl Index {
                     t_ms: r.get(0)?,
                     bbox: [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?],
                     score: r.get(5)?,
+                    foot: match (r.get::<_, Option<f32>>(6)?, r.get::<_, Option<f32>>(7)?) {
+                        (Some(x), Some(y)) => Some([x, y]),
+                        _ => None,
+                    },
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -251,10 +266,11 @@ mod tests {
         let t1 = i
             .add_track("door", "person", "person", 11_000, 0.8, 896, 672, None)
             .unwrap();
-        let b = |t, x| TrackBox {
+        let b = |t, x: f32| TrackBox {
             t_ms: t,
             bbox: [x, 10.0, x + 50.0, 130.0],
             score: 0.9,
+            foot: Some([x + 25.0, 128.0]),
         };
         i.extend_track(
             t1,
@@ -286,6 +302,8 @@ mod tests {
             [11_000, 12_000, 16_500]
         );
         assert_eq!(boxes[1].bbox, [140.0, 10.0, 190.0, 130.0]);
+        assert_eq!(boxes[1].foot, Some([165.0, 128.0]));
+        assert_eq!(boxes[1].foot, Some([165.0, 128.0]));
 
         let c = i.compare_tracks(0, 200_000).unwrap();
         assert_eq!(c.len(), 1);

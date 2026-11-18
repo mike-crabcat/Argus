@@ -95,6 +95,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("chunk", "remote", "TEXT"),
     ("init_segment", "uploaded_at", "INTEGER"),
     ("init_segment", "remote", "TEXT"),
+    // Detection: where a person stood (pose model), NULL if not known.
+    ("track_box", "foot_x", "REAL"),
+    ("track_box", "foot_y", "REAL"),
 ];
 
 /// A chunk replay can read, with where its bytes are.

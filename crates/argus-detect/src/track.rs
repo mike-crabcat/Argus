@@ -48,6 +48,8 @@ pub struct Seen {
     pub class: &'static str,
     pub score: f32,
     pub bbox: BBox,
+    /// Where it stands, if known (people, from the pose model).
+    pub foot: Option<[f32; 2]>,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +101,7 @@ pub struct Track {
     pub first_us: i64,
     pub last_us: i64,
     pub bbox: BBox,
+    pub foot: Option<[f32; 2]>,
     pub best_score: f32,
     pub hits: u32,
     /// Where it last settled, and when it last moved (None: still).
@@ -189,6 +192,7 @@ impl Tracker {
             let s = &seen[si];
             let t = &mut self.tracks[ti];
             t.bbox = s.bbox;
+            t.foot = s.foot;
             t.last_us = now_us;
             t.hits += 1;
             if s.score > t.best_score {
@@ -253,6 +257,7 @@ impl Tracker {
                 first_us: now_us,
                 last_us: now_us,
                 bbox: s.bbox,
+                foot: s.foot,
                 best_score: s.score,
                 hits: 1,
                 anchor: centre(&s.bbox),
@@ -292,6 +297,7 @@ mod tests {
             class: "person",
             score: 0.9,
             bbox: [x, y, x + 50.0, y + 120.0],
+            foot: None,
         }
     }
 
@@ -301,6 +307,7 @@ mod tests {
             class: "car",
             score: 0.95,
             bbox: [x, 100.0, x + 300.0, 260.0],
+            foot: None,
         }
     }
 
@@ -424,6 +431,7 @@ mod tests {
                 class: "car",
                 score: 0.7,
                 bbox: [x, 20.0, x + 40.0, 45.0],
+                foot: None,
             };
             all.extend(t.update(i * S / 5, &[s]));
         }
@@ -448,6 +456,7 @@ mod tests {
                 class: "bicycle",
                 score: if i < 25 { 0.55 } else { 0.62 },
                 bbox,
+                foot: None,
             };
             all.extend(t.update(i * S / 5, &[s]));
         }
