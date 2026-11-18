@@ -434,6 +434,7 @@ async fn api(agent: Option<Arc<AgentHandle>>) -> (Api, Vec<i64>) {
         plan: Some(s.plan.clone()),
         agent,
         alerts: None,
+        snapshots: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());

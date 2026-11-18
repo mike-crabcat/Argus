@@ -155,6 +155,15 @@ pub enum Command {
         level: Id,
         background: Option<Background>,
     },
+    /// Calibrates a placed camera from point pairs: spots on the ground in
+    /// its picture (fractions of the picture, from the top-left) and the
+    /// same spots on the plan (mm). At least 4, spread out; from 6, a
+    /// mis-click is set aside. `null` removes the calibration.
+    SetCalibration {
+        level: Id,
+        camera: Id,
+        pairs: Option<Vec<crate::calib::CalPair>>,
+    },
     /// Several commands applied together: all or none.
     Batch {
         commands: Vec<Command>,
@@ -593,10 +602,35 @@ impl Plan {
                     fov: *fov,
                     range: *range,
                     mount_height: *mount_height,
+                    calibration: None,
                 });
                 Ok(C::DeleteEntity { level: *level, id })
             }
             C::UpdateEntity { level, entity } => self.update(*level, entity),
+            C::SetCalibration {
+                level,
+                camera,
+                pairs,
+            } => {
+                let new = match pairs {
+                    Some(p) => {
+                        Some(crate::calib::fit(p).map_err(|e| PlanError::Invalid(e.to_string()))?)
+                    }
+                    None => None,
+                };
+                let lvl = self.lvl_mut(*level)?;
+                let cam = lvl
+                    .cameras
+                    .iter_mut()
+                    .find(|c| c.id == *camera)
+                    .ok_or(PlanError::NoEntity(*camera))?;
+                let old = std::mem::replace(&mut cam.calibration, new);
+                Ok(C::SetCalibration {
+                    level: *level,
+                    camera: *camera,
+                    pairs: old.map(|c| c.pairs),
+                })
+            }
             C::DeleteEntity { level, id } => {
                 let inv = self.snapshot(*level)?;
                 self.delete(*level, *id)?;

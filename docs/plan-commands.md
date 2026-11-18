@@ -68,6 +68,7 @@ the main token.
 | `update_entity` | Replaces any entity's fields (same id and type). |
 | `delete_entity` | A node takes its walls with it, and a wall takes its openings. Joints left with no walls go too. |
 | `move_entities` | Moves nodes, walls, rooms, dimensions and cameras by `by`. |
+| `set_calibration` | A placed camera's calibration from point pairs: `image` (fractions of its picture, from the top-left) and `plan` (mm) for 4 or more spots on the ground. Argus fits a homography (from 6 pairs up, setting aside any that disagree with the rest) and stores it with each pair's error; `null` removes it. |
 | `set_background` | A level's background image: `asset`, `mm_per_px`, `offset`, `rotation`, `opacity` (0 to 1), or `null` to remove it. |
 | `replace_level`, `restore_level` | Whole-level replacement (undo uses these; also useful for bulk import). |
 | `batch` | Several commands as one. |

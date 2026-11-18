@@ -533,3 +533,73 @@ fn whole_plan_check() {
     assert!(bad.check().is_err());
     assert!(Plan::empty(1).check().is_err());
 }
+
+#[test]
+fn calibrations_set_undo_and_refuse_bad_pairs() {
+    use argus_plan::calib::{CalPair, pinhole, project};
+    let mut p = demo_house();
+    let lvl = level(&p);
+    let cam = p.levels[0].cameras[0].clone();
+    let h = pinhole(&cam, 4.0 / 3.0).unwrap();
+    let pairs: Vec<CalPair> = [
+        [0.2, 0.6],
+        [0.8, 0.6],
+        [0.1, 0.95],
+        [0.9, 0.95],
+        [0.5, 0.75],
+    ]
+    .iter()
+    .map(|&i| CalPair {
+        image: i,
+        plan: project(&h, i).unwrap(),
+    })
+    .collect();
+    let before = p.clone();
+    let undo = p
+        .apply(&Command::SetCalibration {
+            level: lvl,
+            camera: cam.id,
+            pairs: Some(pairs.clone()),
+        })
+        .unwrap();
+    let c = p.levels[0].cameras[0].calibration.clone().unwrap();
+    assert_eq!(c.pairs, pairs);
+    assert!(c.rms_mm < 1.0 && c.outliers.is_empty());
+    let mid = project(&c.homography, [0.5, 0.5]).unwrap();
+    assert!(mid.dist(project(&h, [0.5, 0.5]).unwrap()) < 1.0);
+    // It survives JSON.
+    let back: Plan = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+    assert_eq!(back.levels[0].cameras[0].calibration, Some(c));
+    // Undo, then redo.
+    let redo = p.apply(&undo).unwrap();
+    assert_eq!(p, before);
+    p.apply(&redo).unwrap();
+    assert!(p.levels[0].cameras[0].calibration.is_some());
+    // Three pairs, or an unknown camera: refused, nothing changed.
+    let now = p.clone();
+    assert!(
+        p.apply(&Command::SetCalibration {
+            level: lvl,
+            camera: cam.id,
+            pairs: Some(pairs[..3].to_vec())
+        })
+        .is_err()
+    );
+    assert!(
+        p.apply(&Command::SetCalibration {
+            level: lvl,
+            camera: Id(99_999),
+            pairs: None
+        })
+        .is_err()
+    );
+    assert_eq!(p, now);
+    // null removes it.
+    p.apply(&Command::SetCalibration {
+        level: lvl,
+        camera: cam.id,
+        pairs: None,
+    })
+    .unwrap();
+    assert!(p.levels[0].cameras[0].calibration.is_none());
+}

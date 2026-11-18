@@ -280,6 +280,7 @@ mod tests {
             fov: 90.0,
             range: 1000.0,
             mount_height: 2000.0,
+            calibration: None,
         };
         let v = camera_cone(&c, 4);
         assert_eq!(v.len(), 6);

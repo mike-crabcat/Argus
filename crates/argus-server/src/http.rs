@@ -87,6 +87,10 @@ pub struct AppState {
     pub agent: Option<Arc<crate::agent::AgentHandle>>,
     /// Notifications, alert rules and briefs.
     pub alerts: Option<Arc<crate::alerts_api::AlertsState>>,
+    /// Where to get a camera's picture now, by camera name (for
+    /// calibration). None, or a camera missing: no snapshots.
+    pub snapshots:
+        Option<Arc<std::collections::HashMap<String, Arc<dyn crate::stills::StillSource>>>>,
 }
 
 /// Who made a request, set by the auth middleware.
@@ -147,6 +151,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events/search", get(crate::search::search))
         .route("/api/detect/compare", get(crate::detect::http::compare))
         .route("/api/detect/tracks", get(crate::detect::http::tracks))
+        .route(
+            "/api/cameras/{camera}/snapshot",
+            get(crate::detect::http::snapshot),
+        )
+        .route(
+            "/api/plan/calibrate",
+            axum::routing::post(crate::detect::http::calibrate),
+        )
         .route("/api/media/{*key}", get(crate::replay::http::media))
         .route("/api/replay", get(crate::replay::http::replay_ws))
         .route("/api/info", get(info))

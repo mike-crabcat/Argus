@@ -288,7 +288,13 @@ struct Spell {
     event_id: Option<i64>,
     boxes: Vec<TrackBox>,
     flushed_us: i64,
+    /// The smoothed floor position so far.
+    at: Option<argus_plan::Point>,
 }
+
+/// How much each new floor position counts against the path so far
+/// (exponential smoothing: foot points jitter a little picture to picture).
+const SMOOTHING: f64 = 0.5;
 
 struct CameraTracks {
     mode: Mode,
@@ -301,6 +307,10 @@ struct CameraTracks {
 pub struct Tracking {
     index: Arc<Mutex<Index>>,
     cameras: HashMap<Arc<str>, CameraTracks>,
+    plan: Option<Arc<crate::plan::PlanStore>>,
+    /// Placed cameras by name, with their level, as of `plan_version`.
+    placed: HashMap<String, (i64, argus_plan::CameraPlacement)>,
+    plan_version: Option<u64>,
 }
 
 fn ms(us: i64) -> i64 {
@@ -308,11 +318,37 @@ fn ms(us: i64) -> i64 {
 }
 
 impl Tracking {
-    pub fn new(index: Arc<Mutex<Index>>) -> Self {
+    /// With a `plan`, positions are mapped onto it through each camera's
+    /// calibration.
+    pub fn new(index: Arc<Mutex<Index>>, plan: Option<Arc<crate::plan::PlanStore>>) -> Self {
         Self {
             index,
             cameras: HashMap::new(),
+            plan,
+            placed: HashMap::new(),
+            plan_version: None,
         }
+    }
+
+    /// Re-reads camera placements when the plan has changed.
+    fn refresh_plan(&mut self) {
+        let Some(store) = &self.plan else { return };
+        let v = store.version();
+        if self.plan_version == Some(v) {
+            return;
+        }
+        self.plan_version = Some(v);
+        self.placed = store
+            .get()
+            .plan
+            .levels
+            .iter()
+            .flat_map(|l| {
+                l.cameras
+                    .iter()
+                    .map(move |c| (c.camera.clone(), (l.id.0 as i64, c.clone())))
+            })
+            .collect();
     }
 
     /// Tracks `camera`: `hold` is how long a track may sit still before
@@ -334,8 +370,35 @@ impl Tracking {
     }
 
     pub fn feed(&mut self, f: &Found) {
+        if !self.cameras.contains_key(&f.camera) {
+            return;
+        }
+        self.refresh_plan();
+        let placed = self
+            .placed
+            .get(&*f.camera)
+            .filter(|(_, c)| c.calibration.is_some());
+        let level = placed.map(|(l, _)| *l);
+        let size = (f.width as f64, f.height as f64);
         let Some(c) = self.cameras.get_mut(&f.camera) else {
             return;
+        };
+        // A track's box (and where it stands, if calibrated).
+        let make = |t: &argus_detect::track::Track, at: &mut Option<argus_plan::Point>| {
+            let mut b = tbox(t);
+            if let Some((_, cam)) = placed {
+                let foot = t.foot.unwrap_or([(t.bbox[0] + t.bbox[2]) / 2.0, t.bbox[3]]);
+                let image = [foot[0] as f64 / size.0, foot[1] as f64 / size.1];
+                if let Some(p) = argus_plan::calib::floor_point(cam, image) {
+                    let s = match *at {
+                        Some(prev) => prev.scale(1.0 - SMOOTHING) + p.scale(SMOOTHING),
+                        None => p,
+                    };
+                    *at = Some(s);
+                    b.plan = Some([s.x, s.y]);
+                }
+            }
+            b
         };
         let seen: Vec<Seen> = f
             .detections
@@ -372,6 +435,7 @@ impl Tracking {
                         f.width,
                         f.height,
                         event_id,
+                        level,
                     );
                     if let Some(id) = event_id {
                         info!(camera = %f.camera, label = t.label, "event started (detection)");
@@ -380,20 +444,24 @@ impl Tracking {
                         }
                     }
                     r.map(|track_id| {
+                        let mut at = None;
+                        let first = make(&t, &mut at);
                         c.spells.insert(
                             t.id,
                             Spell {
                                 track_id,
                                 event_id,
-                                boxes: vec![tbox(&t)],
+                                boxes: vec![first],
                                 flushed_us: t.last_us,
+                                at,
                             },
                         );
                     })
                 }
                 Change::StillMoving(t) => match c.spells.get_mut(&t.id) {
                     Some(s) => {
-                        s.boxes.push(tbox(&t));
+                        let b = make(&t, &mut s.at);
+                        s.boxes.push(b);
                         if t.last_us - s.flushed_us >= FLUSH_US {
                             s.flushed_us = t.last_us;
                             flush(&index, s, &t, ms(t.last_us))
@@ -426,6 +494,7 @@ fn tbox(t: &argus_detect::track::Track) -> TrackBox {
         bbox: t.bbox,
         score: t.best_score,
         foot: t.foot,
+        plan: None,
     }
 }
 
@@ -721,7 +790,7 @@ mod tests {
         let index = Arc::new(Mutex::new(Index::open_in_memory().unwrap()));
         let started = Arc::new(Mutex::new(Vec::new()));
         let s2 = started.clone();
-        let mut t = Tracking::new(index.clone());
+        let mut t = Tracking::new(index.clone(), None);
         t.camera(
             "door",
             Mode::Events,
@@ -811,6 +880,43 @@ pub mod http {
         }
     }
 
+    /// `GET /api/cameras/{camera}/snapshot`: a JPEG of what the camera
+    /// sees now (for calibrating it), from its own snapshot API.
+    pub async fn snapshot(
+        State(st): State<AppState>,
+        axum::extract::Path(camera): axum::extract::Path<String>,
+    ) -> Response {
+        let Some(src) = st.snapshots.as_ref().and_then(|m| m.get(&camera)).cloned() else {
+            return (StatusCode::NOT_FOUND, "no snapshots for that camera").into_response();
+        };
+        match src.grab().await {
+            Ok(jpeg) => (
+                [
+                    (axum::http::header::CONTENT_TYPE, "image/jpeg"),
+                    (axum::http::header::CACHE_CONTROL, "no-store"),
+                ],
+                jpeg,
+            )
+                .into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, format!("snapshot: {e:#}")).into_response(),
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    pub struct CalibrateBody {
+        pub pairs: Vec<argus_plan::calib::CalPair>,
+    }
+
+    /// `POST /api/plan/calibrate` with `{"pairs": [...]}`: the fit those
+    /// pairs give (homography, each pair's error in mm, outliers), without
+    /// saving anything. `set_calibration` saves it.
+    pub async fn calibrate(axum::Json(b): axum::Json<CalibrateBody>) -> Response {
+        match argus_plan::calib::fit(&b.pairs) {
+            Ok(c) => Json(c).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        }
+    }
+
     /// `GET /api/detect/tracks?camera=&from=&to=&boxes=1`: tracks (moving
     /// spells), oldest first, optionally with their boxes.
     pub async fn tracks(
@@ -843,5 +949,87 @@ pub mod http {
             })
             .collect();
         Json(json!({"from": from, "to": to, "tracks": out})).into_response()
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    #[test]
+    fn positions_on_the_demo_house() {
+        use argus_plan::calib::{picture_map, pinhole, to_picture};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::plan::PlanStore::open(dir.path()).unwrap());
+        let mut v = store.get();
+        v.plan = argus_plan::fixture::demo_house();
+        argus_plan::fixture::calibrate_ideal(&mut v.plan).unwrap();
+        store.replace(v).unwrap();
+        let plan = store.get().plan;
+        let cam = plan.levels[0]
+            .cameras
+            .iter()
+            .find(|c| c.camera == "back")
+            .unwrap()
+            .clone();
+        let level = plan.levels[0].id.0 as i64;
+        // Someone walks across the back camera's view, 5 m out: where would
+        // their feet be in a 896x672 picture?
+        let inv = picture_map(&pinhole(&cam, 4.0 / 3.0).unwrap()).unwrap();
+        let (h, a) = (cam.heading.to_radians(), cam.at);
+        let walk = |i: i64| {
+            let side = -2000.0 + 150.0 * i as f64; // across, left to right
+            let (fx, fy) = (h.cos(), h.sin());
+            argus_plan::pt(a.x + 5000.0 * fx + side * fy, a.y + 5000.0 * fy - side * fx)
+        };
+        let index = Arc::new(Mutex::new(Index::open_in_memory().unwrap()));
+        let mut t = Tracking::new(index.clone(), Some(store.clone()));
+        t.camera("back", Mode::Shadow, Duration::from_secs(5), None);
+        let t0 = 1_800_000_000_000_000i64;
+        for i in 0..25 {
+            let p = walk(i);
+            let [u, v] = to_picture(&inv, p).unwrap();
+            let (fx, fy) = ((u * 896.0) as f32, (v * 672.0) as f32);
+            t.feed(&Found {
+                camera: "back".into(),
+                wall_us: t0 + i * 200_000,
+                width: 896,
+                height: 672,
+                detections: vec![Detection {
+                    label: "person",
+                    class: "person",
+                    score: 0.9,
+                    bbox: [fx - 20.0, fy - 120.0, fx + 20.0, fy],
+                    foot: Some(argus_detect::pose::Foot {
+                        x: fx,
+                        y: fy,
+                        ankles: true,
+                    }),
+                }],
+            });
+        }
+        for i in 25..40 {
+            t.feed(&Found {
+                camera: "back".into(),
+                wall_us: t0 + i * 200_000,
+                width: 896,
+                height: 672,
+                detections: vec![],
+            });
+        }
+        let i = index.lock().unwrap();
+        let tracks = i.tracks(Some("back"), 0, i64::MAX).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].level, Some(level));
+        let boxes = i.track_boxes(tracks[0].id).unwrap();
+        assert!(boxes.len() > 15);
+        // Each position is near where they were (smoothing lags a little).
+        for b in &boxes {
+            let k = (b.t_ms * 1000 - t0) / 200_000;
+            let want = walk(k);
+            let [x, y] = b.plan.expect("a position");
+            let off = argus_plan::pt(x, y).dist(want);
+            assert!(off < 250.0, "picture {k}: {off} mm off");
+        }
     }
 }

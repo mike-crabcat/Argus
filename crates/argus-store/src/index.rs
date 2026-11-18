@@ -98,6 +98,10 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // Detection: where a person stood (pose model), NULL if not known.
     ("track_box", "foot_x", "REAL"),
     ("track_box", "foot_y", "REAL"),
+    // Detection: the same on the floor plan (mm), once calibrated.
+    ("track_box", "plan_x", "REAL"),
+    ("track_box", "plan_y", "REAL"),
+    ("track", "level", "INTEGER"),
 ];
 
 /// A chunk replay can read, with where its bytes are.

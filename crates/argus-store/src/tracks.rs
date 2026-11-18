@@ -49,6 +49,8 @@ pub struct TrackRow {
     pub width: u32,
     pub height: u32,
     pub event_id: Option<i64>,
+    /// The floor plan level its positions are on, if any.
+    pub level: Option<i64>,
 }
 
 /// One box of a track.
@@ -59,6 +61,8 @@ pub struct TrackBox {
     pub score: f32,
     /// Where it stood (people), from the pose model.
     pub foot: Option<[f32; 2]>,
+    /// Where that is on the floor plan (mm), once the camera is calibrated.
+    pub plan: Option<[f64; 2]>,
 }
 
 /// One camera's events and tracks over a window, and how many of each
@@ -89,11 +93,15 @@ impl Index {
         width: u32,
         height: u32,
         event_id: Option<i64>,
+        level: Option<i64>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO track (camera, label, class, start_ms, end_ms, score, width, height, event_id)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8)",
-            params![camera, label, class, start_ms, score, width, height, event_id],
+            "INSERT INTO track (camera, label, class, start_ms, end_ms, score, width, height,
+                                event_id, level)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                camera, label, class, start_ms, score, width, height, event_id, level
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -115,8 +123,9 @@ impl Index {
         )?;
         {
             let mut st = tx.prepare_cached(
-                "INSERT INTO track_box (track_id, t_ms, x1, y1, x2, y2, score, foot_x, foot_y)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO track_box (track_id, t_ms, x1, y1, x2, y2, score, foot_x, foot_y,
+                                        plan_x, plan_y)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for b in boxes {
                 st.execute(params![
@@ -129,6 +138,8 @@ impl Index {
                     b.score,
                     b.foot.map(|f| f[0]),
                     b.foot.map(|f| f[1]),
+                    b.plan.map(|p| p[0]),
+                    b.plan.map(|p| p[1]),
                 ])?;
             }
         }
@@ -139,7 +150,8 @@ impl Index {
     /// Tracks overlapping [from_ms, to_ms), oldest first; one camera or all.
     pub fn tracks(&self, camera: Option<&str>, from_ms: i64, to_ms: i64) -> Result<Vec<TrackRow>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT id, camera, label, class, start_ms, end_ms, score, width, height, event_id
+            "SELECT id, camera, label, class, start_ms, end_ms, score, width, height, event_id,
+                    level
                FROM track WHERE (?1 IS NULL OR camera = ?1) AND end_ms >= ?2 AND start_ms < ?3
               ORDER BY start_ms",
         )?;
@@ -156,6 +168,7 @@ impl Index {
                     width: r.get(7)?,
                     height: r.get(8)?,
                     event_id: r.get(9)?,
+                    level: r.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -164,7 +177,7 @@ impl Index {
 
     pub fn track_boxes(&self, id: i64) -> Result<Vec<TrackBox>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT t_ms, x1, y1, x2, y2, score, foot_x, foot_y FROM track_box
+            "SELECT t_ms, x1, y1, x2, y2, score, foot_x, foot_y, plan_x, plan_y FROM track_box
               WHERE track_id = ?1 ORDER BY t_ms",
         )?;
         let rows = st
@@ -174,6 +187,10 @@ impl Index {
                     bbox: [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?],
                     score: r.get(5)?,
                     foot: match (r.get::<_, Option<f32>>(6)?, r.get::<_, Option<f32>>(7)?) {
+                        (Some(x), Some(y)) => Some([x, y]),
+                        _ => None,
+                    },
+                    plan: match (r.get::<_, Option<f64>>(8)?, r.get::<_, Option<f64>>(9)?) {
                         (Some(x), Some(y)) => Some([x, y]),
                         _ => None,
                     },
@@ -264,13 +281,24 @@ mod tests {
             .unwrap();
         // Argus: the person (starting a second later) and a cat nobody else saw.
         let t1 = i
-            .add_track("door", "person", "person", 11_000, 0.8, 896, 672, None)
+            .add_track(
+                "door",
+                "person",
+                "person",
+                11_000,
+                0.8,
+                896,
+                672,
+                None,
+                Some(1),
+            )
             .unwrap();
         let b = |t, x: f32| TrackBox {
             t_ms: t,
             bbox: [x, 10.0, x + 50.0, 130.0],
             score: 0.9,
             foot: Some([x + 25.0, 128.0]),
+            plan: Some([x as f64 * 10.0, 5000.0]),
         };
         i.extend_track(
             t1,
@@ -283,7 +311,17 @@ mod tests {
         i.extend_track(t1, 16_500, "person", 0.85, &[b(16_500, 200.0)])
             .unwrap();
         let t2 = i
-            .add_track("door", "animal", "cat", 50_000, 0.7, 896, 672, Some(9))
+            .add_track(
+                "door",
+                "animal",
+                "cat",
+                50_000,
+                0.7,
+                896,
+                672,
+                Some(9),
+                None,
+            )
             .unwrap();
         i.extend_track(t2, 52_000, "cat", 0.7, &[]).unwrap();
 
@@ -303,7 +341,11 @@ mod tests {
         );
         assert_eq!(boxes[1].bbox, [140.0, 10.0, 190.0, 130.0]);
         assert_eq!(boxes[1].foot, Some([165.0, 128.0]));
+        assert_eq!(boxes[1].plan, Some([1400.0, 5000.0]));
+        assert_eq!(all[0].level, Some(1));
         assert_eq!(boxes[1].foot, Some([165.0, 128.0]));
+        assert_eq!(boxes[1].plan, Some([1400.0, 5000.0]));
+        assert_eq!(all[0].level, Some(1));
 
         let c = i.compare_tracks(0, 200_000).unwrap();
         assert_eq!(c.len(), 1);

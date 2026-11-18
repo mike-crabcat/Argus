@@ -36,11 +36,97 @@
       ],
       "type": "object"
     },
+    "CalPair": {
+      "description": "One clicked pair.",
+      "properties": {
+        "image": {
+          "description": "In the picture: [x, y] as fractions of its width and height, from\nthe top-left.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "plan": {
+          "$ref": "#/$defs/Point",
+          "description": "The same spot on the plan, mm."
+        }
+      },
+      "required": [
+        "image",
+        "plan"
+      ],
+      "type": "object"
+    },
+    "Calibration": {
+      "description": "A camera's calibration, as stored on its placement.",
+      "properties": {
+        "errors": {
+          "description": "How far each pair's picture point lands from its plan point, mm.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "homography": {
+          "description": "Picture fractions to plan mm, row-major 3x3.",
+          "items": {
+            "format": "double",
+            "type": "number"
+          },
+          "maxItems": 9,
+          "minItems": 9,
+          "type": "array"
+        },
+        "outliers": {
+          "description": "Pairs the fit set aside as not agreeing with the rest.",
+          "items": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "pairs": {
+          "items": {
+            "$ref": "#/$defs/CalPair"
+          },
+          "type": "array"
+        },
+        "rms_mm": {
+          "description": "Root mean square of the kept pairs' errors, mm.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "pairs",
+        "homography",
+        "errors",
+        "outliers",
+        "rms_mm"
+      ],
+      "type": "object"
+    },
     "CameraPlacement": {
       "description": "A camera from the Argus config, placed on the plan.",
       "properties": {
         "at": {
           "$ref": "#/$defs/Point"
+        },
+        "calibration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Calibration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which floor point each point of its picture shows, once calibrated\n(`set_calibration`)."
         },
         "camera": {
           "description": "The camera's `name` in argus.toml.",
@@ -1000,6 +1086,36 @@
       "required": [
         "op",
         "level"
+      ],
+      "type": "object"
+    },
+    {
+      "description": "Calibrates a placed camera from point pairs: spots on the ground in\nits picture (fractions of the picture, from the top-left) and the\nsame spots on the plan (mm). At least 4, spread out; from 6, a\nmis-click is set aside. `null` removes the calibration.",
+      "properties": {
+        "camera": {
+          "$ref": "#/$defs/Id"
+        },
+        "level": {
+          "$ref": "#/$defs/Id"
+        },
+        "op": {
+          "const": "set_calibration",
+          "type": "string"
+        },
+        "pairs": {
+          "items": {
+            "$ref": "#/$defs/CalPair"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "op",
+        "level",
+        "camera"
       ],
       "type": "object"
     },

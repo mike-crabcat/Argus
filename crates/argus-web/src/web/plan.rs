@@ -3,6 +3,9 @@
 //! [`Command`] applied locally (with undo) and saved to the server in
 //! batches through `/api/plan/commands`.
 
+mod calib;
+mod paths;
+
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -88,6 +91,16 @@ enum Msg {
         orig: [u32; 2],
         rgba: Vec<u8>,
     },
+    /// A camera's picture for calibrating it.
+    Snapshot {
+        key: String,
+        from: &'static str,
+        size: [usize; 2],
+        orig: [u32; 2],
+        rgba: Vec<u8>,
+    },
+    SnapshotFailed(String),
+    Tracks(Vec<paths::TrackPath>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +209,15 @@ pub struct PlanView {
     ask_text: String,
     /// The draft under review: (summary, warnings, cost in USD).
     draft_info: Option<(String, Vec<String>, f64)>,
+    /// A camera being calibrated.
+    calib: Option<calib::Calib>,
+    /// Tracks with plan positions, for paths on the map.
+    tracks: Vec<paths::TrackPath>,
+    tracks_ms: f64,
+    /// Live mode: only what is moving now, polled every second.
+    live: bool,
+    /// Paths drawn last frame: (screen points, index in tracks).
+    path_hits: Vec<(Vec<Pos2>, usize)>,
 }
 
 fn sp(v: &View, p: Point) -> Pos2 {
@@ -249,6 +271,11 @@ impl PlanView {
             agent_busy: None,
             ask_text: String::new(),
             draft_info: None,
+            calib: None,
+            tracks: Vec::new(),
+            tracks_ms: f64::NEG_INFINITY,
+            live: false,
+            path_hits: Vec::new(),
         };
         v.load(ctx);
         v
@@ -341,6 +368,26 @@ impl PlanView {
                     let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
                     let tex = ctx.load_texture(format!("plan-bg-{id}"), img, Default::default());
                     self.bgs.insert(id, Bg { tex, px: orig });
+                }
+                Msg::Snapshot {
+                    key,
+                    from,
+                    size,
+                    orig,
+                    rgba,
+                } => {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                    let tex = ctx.load_texture(key.clone(), img, Default::default());
+                    self.bgs.insert(key.clone(), Bg { tex, px: orig });
+                    if let Some(k) = &mut self.calib {
+                        k.snap = calib::Snap::Ready(key, from);
+                    }
+                }
+                Msg::Tracks(t) => self.tracks = t,
+                Msg::SnapshotFailed(e) => {
+                    if let Some(k) = &mut self.calib {
+                        k.snap = calib::Snap::Failed(e);
+                    }
                 }
             }
         }
@@ -545,6 +592,14 @@ impl PlanView {
                 serde_json::json!({ "camera": c.camera, "x": p.x, "y": p.y })
             }).collect::<Vec<_>>()),
             "window": WINDOWS[self.window].0,
+            "paths": self.paths_stats(),
+            "calibrating": self.calib.as_ref().map(|k| serde_json::json!({
+                "camera": k.name, "pairs": k.pairs.len(), "pending": k.pending.is_some(),
+                "rms_mm": k.fit.as_ref().and_then(|f| f.as_ref().ok()).map(|f| f.rms_mm),
+                "outliers": k.fit.as_ref().and_then(|f| f.as_ref().ok()).map(|f| f.outliers.clone()),
+                "picture": matches!(k.snap, calib::Snap::Ready(..)),
+                "image": k.image_rect.map(|r| [r.min.x, r.min.y, r.width(), r.height()]),
+            })),
             "headings": l.map(|l| l.cameras.iter().map(|c| (c.camera.clone(), c.heading)).collect::<std::collections::BTreeMap<_, _>>()),
         })
     }
@@ -568,9 +623,14 @@ impl PlanView {
         if let Some(d) = &self.doc
             && d.dirty()
             && !d.saving()
-            && now_ms() - self.last_edit_ms > AUTOSAVE_MS
         {
-            self.save(&ctx);
+            let wait = AUTOSAVE_MS - (now_ms() - self.last_edit_ms);
+            if wait <= 0.0 {
+                self.save(&ctx);
+            } else {
+                // Come back to save even if nothing else happens.
+                ctx.request_repaint_after(std::time::Duration::from_millis(wait as u64 + 20));
+            }
         }
         if self.camera_pick.is_empty()
             || (!cameras.contains(&self.camera_pick) && !cameras.is_empty())
@@ -592,6 +652,14 @@ impl PlanView {
             canvas.max.x = r.left();
             r
         });
+        let calib_pane = (self.editing && self.calib.is_some()).then(|| {
+            let r = Rect::from_min_max(
+                canvas.min,
+                pos2(canvas.left() + canvas.width() * 0.5, canvas.bottom()),
+            );
+            canvas.min.x = r.right();
+            r
+        });
         self.canvas = canvas;
 
         if self.doc.is_none() {
@@ -610,11 +678,18 @@ impl PlanView {
         }
         if !self.editing {
             self.fetch_events(&ctx);
+            self.fetch_tracks(&ctx);
+            if self.live {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
         }
         if self.view.is_none() {
             self.fit();
         }
         self.canvas_ui(ui, canvas, cameras);
+        if let Some(r) = calib_pane {
+            self.calib_image_ui(ui, r);
+        }
         self.bar_ui(ui, bar, admin && wide);
         if let Some(r) = props {
             self.props_ui(ui, r, cameras);
@@ -647,6 +722,7 @@ impl PlanView {
 
     fn set_editing(&mut self, on: bool) {
         self.editing = on;
+        self.calib = None;
         self.tool = Tool::Select;
         self.chain = None;
         self.first_click = None;
@@ -733,7 +809,14 @@ impl PlanView {
                     self.window = i;
                     self.events_ms = f64::NEG_INFINITY;
                     self.events.clear();
+                    self.live = false;
+                    self.tracks_ms = f64::NEG_INFINITY;
                 }
+            }
+            if pill(ui, &p, &mut x, cy, "Live", self.live, id.with("live")).clicked() {
+                self.live = !self.live;
+                self.tracks_ms = f64::NEG_INFINITY;
+                self.tracks.clear();
             }
         }
         if self.editing {
@@ -1029,7 +1112,8 @@ impl PlanView {
 
         // Pan: middle or right drag always; primary with the Pan tool or
         // when only viewing.
-        let primary_pans = !self.editing || self.tool == Tool::Pan;
+        let calibrating = self.editing && self.calib.is_some();
+        let primary_pans = !self.editing || self.tool == Tool::Pan || calibrating;
         let panning = resp.dragged_by(egui::PointerButton::Middle)
             || resp.dragged_by(egui::PointerButton::Secondary)
             || (primary_pans && resp.dragged_by(egui::PointerButton::Primary));
@@ -1043,7 +1127,7 @@ impl PlanView {
 
         // What a draw tool would do here.
         let mut hint: Option<Hint> = None;
-        if self.editing && !panning {
+        if self.editing && !panning && !calibrating {
             if let (Some(w), Some(l)) = (world, self.level()) {
                 hint = match self.tool {
                     Tool::Wall | Tool::Dimension | Tool::Room | Tool::Camera | Tool::Scale => {
@@ -1065,7 +1149,13 @@ impl PlanView {
             }
         }
 
-        if self.editing && !panning {
+        if calibrating {
+            if resp.clicked()
+                && let Some(w) = world
+            {
+                self.calib_plan_click(w);
+            }
+        } else if self.editing && !panning {
             self.pointer_actions(&resp, world, &hint, tol, cameras);
         }
         if !resp.dragged() && matches!(self.drag, Some(Drag::Pan)) {
@@ -1094,13 +1184,18 @@ impl PlanView {
             let mut hot = self.sel.clone();
             hot.extend(drafted);
             draw_level(&p, &view, l, &hot, hover, self.editing);
+            self.draw_calib_plan(&p, &view);
         }
         if !self.editing
             && let Some(l) = &level
         {
-            self.draw_events(&p, &view, l, canvas, pointer);
+            if !self.live {
+                self.draw_events(&p, &view, l, canvas, pointer);
+            }
+            self.draw_paths(&p, &view, l.id);
             if resp.clicked()
                 && let Some(at) = resp.interact_pointer_pos()
+                && !self.tap_path(at)
             {
                 self.map_tap(&view, l, at);
             }
@@ -1755,6 +1850,10 @@ impl PlanView {
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
             ui.style_mut().spacing.interact_size.y = 26.0;
+            if self.calib.is_some() {
+                self.calib_props(ui);
+                return;
+            }
             match (self.sel.len(), self.tool) {
                 (0, Tool::Scale) => self.scale_props(ui),
                 (0, Tool::Wall) => {
@@ -2274,6 +2373,7 @@ impl PlanView {
         }
         let mut e = self.edit.clone().unwrap();
         let level = l.id;
+        let mut calibrate: Option<Id> = None;
         match &mut e {
             Entity::Wall(w) => {
                 heading(ui, "Wall");
@@ -2408,12 +2508,44 @@ impl PlanView {
                     10.0,
                 );
                 hint(ui, "Drag the handle on the camera to aim it.");
+                ui.add_space(4.0);
+                match &c.calibration {
+                    Some(k) => hint(
+                        ui,
+                        &format!(
+                            "Calibrated from {} points ({:.0} mm RMS): people and cars it sees are placed on the plan.",
+                            k.pairs.len(),
+                            k.rms_mm
+                        ),
+                    ),
+                    None => hint(
+                        ui,
+                        "Not calibrated: what it sees isn't placed on the plan yet.",
+                    ),
+                }
+                if btn(
+                    ui,
+                    if c.calibration.is_some() {
+                        "Recalibrate…"
+                    } else {
+                        "Calibrate…"
+                    },
+                )
+                .clicked()
+                {
+                    calibrate = Some(c.id);
+                }
             }
             Entity::Node(n) => {
                 heading(ui, "Joint");
                 num(ui, "x", &mut n.at.x, -1e6..=1e6, " mm", 10.0);
                 num(ui, "y", &mut n.at.y, -1e6..=1e6, " mm", 10.0);
             }
+        }
+        // The calibration isn't edited here: keep the plan's, so a stale
+        // copy never undoes a calibration made meanwhile.
+        if let (Entity::Camera(c), Entity::Camera(now)) = (&mut e, &cur) {
+            c.calibration = now.calibration.clone();
         }
         // Commit once nothing is being dragged or typed.
         let busy = ui.ctx().dragged_id().is_some() || ui.ctx().text_edit_focused();
@@ -2432,6 +2564,10 @@ impl PlanView {
         ui.add_space(6.0);
         if btn(ui, "Delete").clicked() {
             self.delete_selection();
+        }
+        if let Some(camera) = calibrate {
+            let ctx = ui.ctx().clone();
+            self.start_calibration(&ctx, level, camera);
         }
     }
 }

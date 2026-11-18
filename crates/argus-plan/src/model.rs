@@ -166,6 +166,10 @@ pub struct CameraPlacement {
     pub range: f64,
     /// Height above the floor, mm.
     pub mount_height: f64,
+    /// Which floor point each point of its picture shows, once calibrated
+    /// (`set_calibration`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<crate::calib::Calibration>,
 }
 
 /// An image under a level (a scanned plan or a site photo), placed by its
