@@ -16,6 +16,8 @@ pub struct Config {
     pub http: Option<Http>,
     #[serde(default, rename = "camera")]
     pub cameras: Vec<Camera>,
+    /// A model for agent features (plan import...). Off without it.
+    pub agent: Option<argus_agent::config::AgentConfig>,
 }
 
 /// An S3 bucket, on AWS or any S3-compatible store (MinIO, Backblaze B2,

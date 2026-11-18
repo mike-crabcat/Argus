@@ -81,3 +81,20 @@ upload.main = "always"
 labels = ["person", "vehicle", "animal", "motion"]   # default: no motion
 poll_ms = 1000
 hold_ms = 5000                       # end an event 5 s after last detection
+
+# Optional: a model for agent features (importing a floor plan from a
+# sketch, "ask the agent to change the plan"). Any OpenAI-compatible
+# chat-completions API works: OpenAI, OpenRouter, Zhipu GLM, a local server.
+# The key lives in its own file (chmod 600), never in this one. Prices let
+# Argus track spending against the monthly cap. Without this section the
+# agent features just say a model needs setting up.
+# [agent]
+# provider = "openai"
+# base_url = "https://openrouter.ai/api/v1"
+# model = "vendor/model-name"
+# api_key_file = "/home/you/.config/argus/agent-key"
+# monthly_cap_usd = 10
+# price_input_per_mtok = 0.5     # USD per million input tokens
+# price_output_per_mtok = 1.5
+# timeout_seconds = 120
+# max_steps = 6

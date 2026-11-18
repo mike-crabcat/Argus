@@ -135,6 +135,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "argus-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argus-proto",
+ "axum",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "argus-ingest"
 version = "0.1.0"
 dependencies = [
@@ -181,6 +198,7 @@ name = "argus-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argus-agent",
  "argus-ingest",
  "argus-media",
  "argus-plan",

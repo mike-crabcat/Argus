@@ -219,6 +219,10 @@ async fn run(cfg: Config) -> Result<()> {
             plan: Some(Arc::new(argus_server::plan::PlanStore::open(
                 &cfg.storage.root,
             )?)),
+            agent: cfg
+                .agent
+                .as_ref()
+                .map(|a| Arc::new(argus_server::agent::AgentHandle::new(a, &cfg.storage.root))),
             public_url: h
                 .public_url
                 .as_deref()

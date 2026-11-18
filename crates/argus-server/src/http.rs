@@ -20,6 +20,8 @@
 //! * `GET /api/plan`, `PUT /api/plan`, `POST /api/plan/commands`,
 //!   `POST /api/plan/assets`, `GET /api/plan/assets/{id}`: the floor plan
 //!   (see [`crate::plan`] and docs/plan-commands.md).
+//! * `GET /api/agent/status`: whether a model is set up; spending for the
+//!   main token.
 //! * Anything else: static files from `[http] web_root` (the browser app),
 //!   if configured. These need no token; the API does.
 //!
@@ -73,6 +75,8 @@ pub struct AppState {
     pub public_url: Option<Arc<str>>,
     /// The floor plan. None disables the plan routes.
     pub plan: Option<Arc<crate::plan::PlanStore>>,
+    /// The model, if `[agent]` is configured.
+    pub agent: Option<Arc<crate::agent::AgentHandle>>,
 }
 
 /// Who made a request, set by the auth middleware.
@@ -150,6 +154,7 @@ pub fn router(state: AppState) -> Router {
             ),
         )
         .route("/api/plan/assets/{id}", get(crate::plan::get_asset))
+        .route("/api/agent/status", get(crate::agent::status))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     api.route("/healthz", get(healthz))
         .fallback(static_file)
