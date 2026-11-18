@@ -269,3 +269,24 @@ async fn openai_compatible_client() {
     let e = bad.chat(&req).await.unwrap_err().to_string();
     assert!(!e.contains("sk-secret"), "{e}");
 }
+
+#[test]
+fn temperature_is_sent_as_written_and_provider_errors_are_kept() {
+    let c = OpenAiCompat::new("http://x/v1", "m", None, std::time::Duration::from_secs(1)).unwrap();
+    let body = c.body(&ChatRequest {
+        temperature: Some(0.2),
+        ..Default::default()
+    });
+    // Not 0.20000000298023224: Z.AI's GLM refuses more than two decimals.
+    assert_eq!(body["temperature"].to_string(), "0.2");
+    let e = argus_agent::openai::parse_response(&json!({"error": {
+        "message": "Provider returned error", "code": 400,
+        "metadata": {"provider_name": "Z.AI", "raw": "{\"error\":{\"code\":\"1210\",\"message\":\"The temperature parameter is illegal.\"}}"}
+    }}))
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.contains("Provider returned error (Z.AI: The temperature parameter is illegal.)"),
+        "{e}"
+    );
+}
