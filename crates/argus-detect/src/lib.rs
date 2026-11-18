@@ -1,5 +1,7 @@
-//! Argus's own object detection. For now: decoding camera streams to
-//! pictures ([`decode`]).
+//! Argus's own object detection: decoding camera streams to pictures
+//! ([`decode`]) and finding people, vehicles and animals in them
+//! ([`model`]).
 
 pub mod decode;
+pub mod model;
 pub mod testing;

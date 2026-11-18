@@ -191,7 +191,16 @@ async fn run(cfg: Config) -> Result<()> {
             .filter_map(|c| live.get(&c.name, &d.stream))
             .collect();
         info!(cameras = streams.len(), stream = %d.stream, fps = d.fps, "detection: decoding");
-        argus_server::detect::spawn(streams, d.fps);
+        let model = match &d.model {
+            Some(path) => Some(argus_server::detect::ModelSpec {
+                path: path.clone(),
+                device: d.device()?,
+                threshold: d.threshold,
+            }),
+            None => None,
+        };
+        argus_server::detect::set_report_every(d.log_seconds);
+        argus_server::detect::spawn(streams, d.fps, model);
     }
 
     let mut background = Vec::new();
