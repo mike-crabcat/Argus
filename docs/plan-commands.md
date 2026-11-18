@@ -14,6 +14,9 @@ the code in `crates/argus-plan` and checked by its tests.
   numeric `id`, unique across the plan and never reused. Commands that add
   something take an optional `id`. Give one (unused) to refer to the new
   entity later in the same batch. Leave it out and you get the next free id.
+  Ids a batch gives are kept free while it is applied: wall ends and split
+  walls, which Argus numbers itself, skip them, so a batch can number its
+  walls 2, 3, 4... and refer to them.
 - Walls run along their centreline from node `a` to node `b`. Walls that
   share a node are joined there, so corners mitre. A wall end given as a
   point joins any node within 1 mm, or splits any wall it lands on (a

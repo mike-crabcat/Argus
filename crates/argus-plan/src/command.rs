@@ -283,7 +283,11 @@ impl Plan {
     /// that undoes it.
     pub fn apply(&mut self, cmd: &Command) -> Result<Command, PlanError> {
         let backup = self.clone();
+        let mut ids = Vec::new();
+        explicit_ids(cmd, &mut ids);
+        self.reserved = ids;
         let r = self.apply_inner(cmd);
+        self.reserved.clear();
         if r.is_err() {
             *self = backup;
         }
@@ -797,10 +801,7 @@ impl Plan {
         if self.levels.is_empty() {
             return invalid("a plan needs at least one level");
         }
-        let mut seen = Plan {
-            levels: Vec::new(),
-            next_id: self.next_id,
-        };
+        let mut seen = Plan::empty(self.next_id);
         for l in &self.levels {
             seen.check_level(l, None)?;
             seen.levels.push(l.clone());
@@ -861,6 +862,22 @@ fn check_polygon(p: &[Point]) -> Result<(), PlanError> {
         return invalid("a room outline needs at least three points");
     }
     Ok(())
+}
+
+/// Ids a command (or batch) gives new entities explicitly.
+fn explicit_ids(cmd: &Command, out: &mut Vec<u64>) {
+    use Command as C;
+    match cmd {
+        C::Batch { commands } => commands.iter().for_each(|c| explicit_ids(c, out)),
+        C::AddLevel { id, .. }
+        | C::AddWall { id, .. }
+        | C::AddOpening { id, .. }
+        | C::AddRoom { id, .. }
+        | C::AddDimension { id, .. }
+        | C::PlaceCamera { id, .. } => out.extend(id.map(|i| i.0)),
+        C::SplitWall { node, new_wall, .. } => out.extend(node.iter().chain(new_wall).map(|i| i.0)),
+        _ => {}
+    }
 }
 
 /// The JSON Schema of [`Command`], for tools that write commands.

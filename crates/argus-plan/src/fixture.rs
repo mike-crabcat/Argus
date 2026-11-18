@@ -41,10 +41,8 @@ fn rec(p: &mut Plan, out: &mut Vec<Command>, mut cmd: Command) {
 /// a scripted model, say) on any plan whose next free id is at most
 /// `first_id`.
 pub fn demo_house_commands(level: Id, first_id: u64) -> Vec<Command> {
-    let mut p = Plan {
-        levels: vec![Level::new(level, "Ground")],
-        next_id: first_id,
-    };
+    let mut p = Plan::empty(first_id);
+    p.levels.push(Level::new(level, "Ground"));
     let mut out: Vec<Command> = Vec::new();
     let wall = |p: &mut Plan, out: &mut Vec<Command>, a: (f64, f64), b: (f64, f64), t: f64| {
         rec(

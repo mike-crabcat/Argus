@@ -457,6 +457,54 @@ fn schema_file_is_current() {
     );
 }
 
+/// A batch naming its walls with consecutive ids works, though each wall's
+/// ends are numbered as it is added (models write batches like this).
+#[test]
+fn batches_can_number_their_walls_consecutively() {
+    let mut p = Plan::default();
+    let lv = level(&p);
+    let w = |id: u64, a: (f64, f64), b: (f64, f64)| Command::AddWall {
+        level: lv,
+        id: Some(Id(id)),
+        a: End::At(pt(a.0, a.1)),
+        b: End::At(pt(b.0, b.1)),
+        thickness: 230.0,
+    };
+    let batch = vec![
+        w(2, (0.0, 0.0), (4000.0, 0.0)),
+        w(3, (4000.0, 0.0), (4000.0, 3000.0)),
+        w(4, (4000.0, 3000.0), (0.0, 3000.0)),
+        w(5, (0.0, 3000.0), (0.0, 0.0)),
+        Command::AddOpening {
+            level: lv,
+            id: Some(Id(6)),
+            wall: Id(3),
+            kind: OpeningKind::Window,
+            offset: 1500.0,
+            width: 900.0,
+            swing: None,
+        },
+    ];
+    let before = p.clone();
+    let inv = p.apply_all(&batch).unwrap();
+    let l = &p.levels[0];
+    assert_eq!(
+        l.walls.iter().map(|w| w.id.0).collect::<Vec<_>>(),
+        vec![2, 3, 4, 5]
+    );
+    assert_eq!(l.openings[0].wall, Id(3));
+    assert!(
+        l.nodes.iter().all(|n| n.id.0 > 6),
+        "wall ends skip the batch's ids"
+    );
+    // The same batch on a copy gives the same plan (browser and server agree).
+    let mut again = before.clone();
+    again.apply_all(&batch).unwrap();
+    assert_eq!(again, p);
+    p.apply(&inv).unwrap();
+    assert_eq!(p.levels, before.levels);
+}
+
 #[test]
 fn whole_plan_check() {
     let mut p = demo_house();
@@ -471,12 +519,5 @@ fn whole_plan_check() {
     let mut bad = demo_house();
     bad.levels[0].nodes.remove(0);
     assert!(bad.check().is_err());
-    assert!(
-        Plan {
-            levels: vec![],
-            next_id: 1
-        }
-        .check()
-        .is_err()
-    );
+    assert!(Plan::empty(1).check().is_err());
 }
