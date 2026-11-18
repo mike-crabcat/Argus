@@ -263,6 +263,10 @@ pub struct EventsConfig {
     /// Have the agent (if configured) summarise this camera's events.
     /// Default: true.
     pub summarize: Option<bool>,
+    /// With `[detect]`: "shadow" (the default) stores Argus's tracks next
+    /// to the camera's own events, to compare; "events" makes events from
+    /// Argus's tracks instead of the camera's detections.
+    pub detect: Option<String>,
 }
 
 impl std::fmt::Debug for EventsConfig {
@@ -275,6 +279,7 @@ impl std::fmt::Debug for EventsConfig {
             .field("poll_ms", &self.poll_ms)
             .field("hold_ms", &self.hold_ms)
             .field("labels", &self.labels)
+            .field("detect", &self.detect)
             .finish()
     }
 }
@@ -375,6 +380,24 @@ impl Camera {
             .as_ref()
             .and_then(|e| e.summarize)
             .unwrap_or(true)
+    }
+
+    /// What Argus's own detections become on this camera.
+    pub fn detect_mode(&self) -> Result<crate::detect::Mode> {
+        use crate::detect::Mode;
+        match self.events.as_ref().and_then(|e| e.detect.as_deref()) {
+            None | Some("shadow") => Ok(Mode::Shadow),
+            Some("events") => Ok(Mode::Events),
+            Some(o) => bail!(
+                "camera {:?}: events.detect {o:?} must be \"shadow\" or \"events\"",
+                self.name
+            ),
+        }
+    }
+
+    /// How long an event lasts after its last sighting.
+    pub fn hold(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.events.as_ref().map_or(5000, |e| e.hold_ms))
     }
 
     /// Reolink event settings, if this camera's events come from Reolink.

@@ -27,10 +27,19 @@ landing one PR at a time.
    cuDNN 9 from NVIDIA's redistributable wheels. COCO classes map to
    Argus's labels: person; car, truck, bus, motorcycle, bicycle as vehicle;
    dog, cat, bird as animal.
-3. **Tracking.** An IoU/ByteTrack-style tracker links boxes into tracks; a
-   track seen for three or more pictures becomes an event in the existing
-   event table, so stills, summaries, alerts and search work unchanged.
-   Each track's boxes, scores and foot points go in a `detection` table.
+3. **Tracking** (`argus-detect::track`, done). Boxes are linked from
+   picture to picture by overlap (IoU, best pairs first, within a label);
+   a track is real after three sightings and over after 2 s unseen. A
+   parked car is detected in every picture, so a track alone is no event:
+   what counts is a *moving spell*, from when the box centre first moves a
+   quarter of the box's size (at least 12 px) until it has sat still for
+   the camera's `hold_ms`. Each spell is stored in the `track` table with
+   its boxes (`track_box`, one per picture, in the sub stream's pixels),
+   kept 30 days. Per camera, `events.detect` decides what else happens:
+   `"shadow"` (the default) only stores, so `/api/detect/compare` can set
+   the spells against the camera's own events; `"events"` also makes each
+   spell an event (source `argus`, with stills) and stops reading the
+   camera's detections.
 4. **Pose.** RTMPose-s (Apache-2.0, MMPose) on person boxes only. The foot
    point is the middle of the two ankles, or the bottom centre of the box
    when the ankles aren't seen; it is what places people on the floor plan
@@ -38,9 +47,9 @@ landing one PR at a time.
 
 ## Rollout
 
-A camera's `events.source` becomes `"reolink"`, `"argus"`, `"both"`, or
-`"shadow"` (Argus detects and stores tracks but makes no events), so the
-two can be compared for a few days before switching.
+Run in shadow mode for a few days, check `/api/detect/compare?hours=72`
+and `/api/detect/tracks`, then switch cameras one at a time with
+`events.detect = "events"`.
 
 ## Load
 

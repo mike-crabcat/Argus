@@ -159,6 +159,7 @@ impl Index {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(crate::summaries::SCHEMA)?;
+        conn.execute_batch(crate::tracks::SCHEMA)?;
         for (table, column, ty) in ADDED_COLUMNS {
             let exists: bool = conn.query_row(
                 &format!("SELECT COUNT(*) > 0 FROM pragma_table_info('{table}') WHERE name = ?1"),
