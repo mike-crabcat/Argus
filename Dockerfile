@@ -10,6 +10,10 @@ FROM ${RUST_IMAGE} AS build
 # "stable".
 ENV RUSTUP_TOOLCHAIN=1.99.1
 RUN rustup target add wasm32-unknown-unknown
+# OpenH264 (detection's decoder) is C++, built from source by its crate.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
 # wasm-bindgen's CLI must match the crate version in Cargo.lock exactly.
 COPY Cargo.lock /tmp/Cargo.lock
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

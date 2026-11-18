@@ -183,6 +183,16 @@ async fn run(cfg: Config) -> Result<()> {
     }
     info!(streams = ingest.len(), root = %cfg.storage.root.display(), "recording");
     let live = Arc::new(live);
+    if let Some(d) = &cfg.detect {
+        let streams: Vec<_> = cfg
+            .cameras
+            .iter()
+            .filter(|c| d.cameras.is_empty() || d.cameras.contains(&c.name))
+            .filter_map(|c| live.get(&c.name, &d.stream))
+            .collect();
+        info!(cameras = streams.len(), stream = %d.stream, fps = d.fps, "detection: decoding");
+        argus_server::detect::spawn(streams, d.fps);
+    }
 
     let mut background = Vec::new();
     if let Some(h) = &cfg.http {
