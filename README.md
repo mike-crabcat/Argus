@@ -142,10 +142,14 @@ When a Reolink camera reports a detection, Argus takes three snapshots
 `events/` in the storage root, until the event's recording leaves local
 disk. With an `[agent]` configured, a background worker sends each
 finished event's stills to the model, with the camera's place on the floor
-plan, and stores a one-line summary, the objects seen and whether it looks
-notable. At most one summary per camera per `summary_gap_seconds` (events
-in between are merged); the monthly cap pauses it. A camera opts out with
-`summarize = false` under `[camera.events]`.
+plan and its `context` line from the config, and stores a one-line
+summary, the objects seen and whether it looks notable. Stills go to the
+model shrunk to 1280 px on their longer edge (`still_max_edge`), which
+costs less than half as much as full size for summaries just as good; the
+saved stills stay full size. At most one summary per camera per
+`summary_gap_seconds` (events in between are merged), which a camera can
+override under `[camera.events]`; the monthly cap pauses it. A camera
+opts out with `summarize = false` under `[camera.events]`.
 
 The search box in the top bar (Search on phones) finds events by their
 summary, label or camera; click one to replay it. With a model set up, it

@@ -8,7 +8,7 @@
 //! events in that window are merged into one. The monthly cap pauses the
 //! worker. Cameras can opt out (`[camera.events] summarize = false`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,7 +39,12 @@ pub struct Worker {
     pub plan: Option<Arc<PlanStore>>,
     pub stills: StillStore,
     pub opted_out: HashSet<String>,
+    /// At most one summary per camera this often (ms)...
     pub gap_ms: i64,
+    /// ...or this often, for cameras with their own gap.
+    pub camera_gap_ms: HashMap<String, i64>,
+    /// Cameras' `context` lines from the config.
+    pub contexts: HashMap<String, String>,
     pub paused_until: i64,
 }
 
@@ -125,8 +130,13 @@ impl Worker {
             }
             // One summary per camera per gap: wait for the window to close
             // and for the gap since the last one.
+            let gap_ms = self
+                .camera_gap_ms
+                .get(&camera)
+                .copied()
+                .unwrap_or(self.gap_ms);
             let first = &events[0];
-            let window_end = first.start_ms + self.gap_ms;
+            let window_end = first.start_ms + gap_ms;
             if now_ms < window_end + SETTLE_MS {
                 continue;
             }
@@ -137,7 +147,7 @@ impl Worker {
                 .last_summary_ms(&camera)
                 .ok()
                 .flatten();
-            if last.is_some_and(|t| now_ms - t < self.gap_ms) {
+            if last.is_some_and(|t| now_ms - t < gap_ms) {
                 continue;
             }
             let group: Vec<&EventRow> = events
@@ -156,7 +166,7 @@ impl Worker {
                 };
                 for n in take {
                     if images.len() < MAX_IMAGES
-                        && let Some(b) = self.stills.read(e.id, n)
+                        && let Some(b) = self.stills.for_model(e.id, n).await
                     {
                         images.push(Part::Image {
                             media_type: "image/jpeg".into(),
@@ -185,6 +195,10 @@ impl Worker {
                 .and_then(|p| argus_plan::context::camera_context(p, &camera))
                 .map(|c| c.describe(&camera))
                 .unwrap_or_else(|| format!("Camera \"{camera}\" isn't on the floor plan."));
+            let place = match self.contexts.get(&camera) {
+                Some(c) => format!("{place}\nWhat this camera looks at: {c}"),
+                None => place,
+            };
             let mut text = format!(
                 "Camera: {camera}\nTime: {} to {}\nThe camera's own detection: {}\n{place}\n",
                 local_time(first.start_ms),

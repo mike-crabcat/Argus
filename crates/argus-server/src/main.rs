@@ -317,6 +317,19 @@ async fn run(cfg: Config) -> Result<()> {
                 .as_deref()
                 .map(|u| Arc::from(u.trim_end_matches('/'))),
         };
+        // Stills as models see them, and what each camera looks at.
+        let model_stills = argus_server::stills::StillStore::new(&cfg.storage.root)
+            .with_model_edge(
+                cfg.agent
+                    .as_ref()
+                    .map_or(argus_server::stills::MODEL_EDGE, |a| a.still_max_edge),
+            );
+        let contexts: std::collections::HashMap<String, String> = cfg
+            .cameras
+            .iter()
+            .filter_map(|c| Some((c.name.clone(), c.context.clone()?.trim().to_owned())))
+            .filter(|(_, c)| !c.is_empty())
+            .collect();
         // Event summaries, if a model is set up.
         if let (Some(handle), Some(ac)) = (&state.agent, &cfg.agent)
             && handle.agent.is_ok()
@@ -326,7 +339,7 @@ async fn run(cfg: Config) -> Result<()> {
                 agent: handle.clone(),
                 index: index.clone(),
                 plan: state.plan.clone(),
-                stills: argus_server::stills::StillStore::new(&cfg.storage.root),
+                stills: model_stills.clone(),
                 opted_out: cfg
                     .cameras
                     .iter()
@@ -334,19 +347,26 @@ async fn run(cfg: Config) -> Result<()> {
                     .map(|c| c.name.clone())
                     .collect(),
                 gap_ms: ac.summary_gap_seconds as i64 * 1000,
+                camera_gap_ms: cfg
+                    .cameras
+                    .iter()
+                    .filter_map(|c| Some((c.name.clone(), c.summary_gap_seconds()? as i64 * 1000)))
+                    .collect(),
+                contexts: contexts.clone(),
                 paused_until: 0,
             };
             info!(gap_s = ac.summary_gap_seconds, "summarising events");
             background.push(tokio::spawn(worker.run()));
         }
-        let engine = argus_server::alerts::Engine::new(
+        let mut engine = argus_server::alerts::Engine::new(
             alerts.rules.clone(),
             index.clone(),
             alerts.notifier.clone(),
             state.agent.clone(),
-            argus_server::stills::StillStore::new(&cfg.storage.root),
+            model_stills,
             tz,
         );
+        engine.contexts = contexts;
         background.push(tokio::spawn(engine.run()));
         if alerts.brief_enabled {
             info!(at = %alerts.brief_time, timezone = %tz.name(), "daily brief");

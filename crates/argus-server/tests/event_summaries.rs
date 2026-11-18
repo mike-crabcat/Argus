@@ -103,9 +103,127 @@ impl Setup {
                 .map(|s| s.to_string())
                 .collect::<HashSet<_>>(),
             gap_ms: MIN,
+            camera_gap_ms: Default::default(),
+            contexts: Default::default(),
             paused_until: 0,
         }
     }
+}
+
+/// A real JPEG of `w` x `h`.
+fn big_jpeg(w: u32, h: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_fn(w, h, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+    });
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+        .encode_image(&img)
+        .unwrap();
+    out
+}
+
+fn jpeg_size(b: &[u8]) -> (u32, u32) {
+    use image::ImageDecoder;
+    image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(b))
+        .unwrap()
+        .dimensions()
+}
+
+#[tokio::test]
+async fn stills_are_shrunk_for_the_model_only() {
+    let s = setup();
+    let t0 = 1_800_000_000_000i64;
+    let id = s.event("doorbell", t0, "person", false);
+    let full = big_jpeg(2560, 1440);
+    s.stills.save(id, 0, &full).unwrap();
+    let small = big_jpeg(640, 360);
+    s.stills.save(id, 1, &small).unwrap();
+
+    let (h, mock) = handle(
+        json!([summary("Someone at the door.", &["person"], false)]),
+        100.0,
+    );
+    let mut w = s.worker(h, &[]);
+    w.stills = s.stills.clone().with_model_edge(1280);
+    let t = w.tick(t0 + 2 * MIN).await;
+    assert_eq!(t.summarized, 1, "{t:?}");
+    let reqs = mock.requests.lock().unwrap().clone();
+    let sizes: Vec<(u32, u32)> = reqs[0].messages[1]
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            argus_agent::Part::Image { data, .. } => Some(jpeg_size(data)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        [(1280, 720), (640, 360)],
+        "big ones shrink, small ones stay"
+    );
+    // The file on disk keeps its full size, for the viewer.
+    assert_eq!(s.stills.read(id, 0).unwrap(), full);
+    // 0: as taken.
+    let as_taken = s.stills.clone().with_model_edge(0);
+    assert_eq!(as_taken.for_model(id, 0).await.unwrap(), full);
+}
+
+#[tokio::test]
+async fn per_camera_gap_and_context() {
+    let s = setup();
+    let t0 = 1_800_000_000_000i64;
+    // The driveway gets one summary per ten minutes; the doorbell keeps
+    // the minute.
+    let d1 = s.event("driveway", t0, "vehicle", true);
+    let d2 = s.event("driveway", t0 + 5 * MIN, "vehicle", true);
+    let f1 = s.event("doorbell", t0, "person", true);
+    let f2 = s.event("doorbell", t0 + 5 * MIN, "person", true);
+    let (h, mock) = handle(
+        json!([
+            summary("A visitor.", &["person"], false),
+            summary("Another visitor.", &["person"], false),
+            summary("Cars pass.", &["car"], false),
+        ]),
+        100.0,
+    );
+    let mut w = s.worker(h, &[]);
+    w.camera_gap_ms.insert("driveway".into(), 10 * MIN);
+    w.contexts.insert(
+        "doorbell".into(),
+        "the front porch and the path to the street".into(),
+    );
+    w.tick(t0 + 2 * MIN).await; // the doorbell's first
+    w.tick(t0 + 7 * MIN).await; // the doorbell's second; the driveway waits
+    {
+        let i = s.index.lock().unwrap();
+        assert!(i.event(f1).unwrap().unwrap().summary.is_some());
+        assert!(i.event(f2).unwrap().unwrap().summary.is_some());
+        assert!(i.event(d1).unwrap().unwrap().summary.is_none());
+    }
+    w.tick(t0 + 11 * MIN).await; // the driveway's window has closed
+    {
+        let i = s.index.lock().unwrap();
+        for id in [d1, d2] {
+            let e = i.event(id).unwrap().unwrap();
+            assert_eq!(
+                e.summary.unwrap().summary,
+                "Cars pass.",
+                "both in one summary"
+            );
+        }
+    }
+    let reqs = mock.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 3);
+    let door = reqs[0].messages[1].joined_text();
+    assert!(
+        door.contains("What this camera looks at: the front porch"),
+        "{door}"
+    );
+    let drive = reqs[2].messages[1].joined_text();
+    assert!(
+        drive.contains("Camera: driveway") && !drive.contains("looks at"),
+        "{drive}"
+    );
 }
 
 #[tokio::test]
