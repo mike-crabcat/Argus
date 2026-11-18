@@ -49,6 +49,8 @@ pub struct Detection {
     pub score: f32,
     /// Left, top, right, bottom, in the picture's pixels.
     pub bbox: [f32; 4],
+    /// For people, where they stand (see [`crate::pose`]).
+    pub foot: Option<crate::pose::Foot>,
 }
 
 /// COCO class index → (class, Argus label), for the classes Argus keeps.
@@ -131,6 +133,7 @@ pub fn postprocess(
                 (cx + bw / 2.0).min(width),
                 (cy + bh / 2.0).min(height),
             ],
+            foot: None,
         });
     }
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -146,6 +149,32 @@ fn environment() -> Result<&'static ort::environment::Environment, ModelError> {
     Ok(ENV.get_or_init(|| env))
 }
 
+/// Loads an ONNX model on `device`. With `Device::Cuda` it fails if CUDA
+/// can't be used, rather than quietly running on the CPU.
+pub(crate) fn open_session(path: &Path, device: Device) -> Result<Session, ModelError> {
+    let env = environment()?;
+    let mut b = Session::builder(env)?;
+    match device {
+        Device::Cpu => {
+            b = b.with_intra_threads(2)?;
+        }
+        #[cfg(feature = "cuda")]
+        Device::Cuda(id) => {
+            b = b.with_execution_providers([ort::ep::CUDA::default()
+                .with_device_id(id)
+                .build()
+                .error_on_failure()])?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        Device::Cuda(_) => {
+            return Err(ModelError::Ort(
+                "this build of Argus has no CUDA support".into(),
+            ));
+        }
+    }
+    Ok(b.commit_from_file(path)?)
+}
+
 pub struct Detector {
     session: Session,
     classes: usize,
@@ -158,27 +187,7 @@ impl Detector {
     /// Loads the model. With `Device::Cuda` it fails if CUDA can't be used,
     /// rather than quietly running on the CPU.
     pub fn open(path: &Path, device: Device) -> Result<Self, ModelError> {
-        let env = environment()?;
-        let mut b = Session::builder(env)?;
-        match device {
-            Device::Cpu => {
-                b = b.with_intra_threads(2)?;
-            }
-            #[cfg(feature = "cuda")]
-            Device::Cuda(id) => {
-                b = b.with_execution_providers([ort::ep::CUDA::default()
-                    .with_device_id(id)
-                    .build()
-                    .error_on_failure()])?;
-            }
-            #[cfg(not(feature = "cuda"))]
-            Device::Cuda(_) => {
-                return Err(ModelError::Ort(
-                    "this build of Argus has no CUDA support".into(),
-                ));
-            }
-        }
-        let session = b.commit_from_file(path)?;
+        let session = open_session(path, device)?;
         let inputs: Vec<String> = session
             .inputs()
             .iter()
@@ -262,6 +271,8 @@ pub const INPUT: usize = 640;
 #[derive(Clone, Debug)]
 pub struct Prepared {
     pub data: Vec<f32>,
+    /// The picture itself, for the pose model's close-ups of people.
+    pub picture: Option<Picture>,
     /// The original picture's size, to map boxes back.
     pub width: u32,
     pub height: u32,
@@ -274,6 +285,7 @@ impl Prepared {
         preprocess(p, INPUT, &mut data);
         Self {
             data,
+            picture: None,
             width: p.width,
             height: p.height,
             wall_us: p.wall_us,

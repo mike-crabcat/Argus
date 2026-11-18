@@ -2,7 +2,7 @@
 //! reports what it finds and how long it takes:
 //!
 //!     cargo run --release -p argus-detect --features cuda --example detect_bench -- \
-//!         MODEL.onnx PICTURE.ppm... [--cuda] [--runs 20] [--boxes DIR]
+//!         MODEL.onnx PICTURE.ppm... [--cuda] [--runs 20] [--boxes DIR] [--pose POSE.onnx]
 //!
 //! `--boxes` writes the pictures with their boxes drawn, to check by eye.
 //! Keep them out of the repository: they are camera images.
@@ -52,6 +52,7 @@ fn main() -> anyhow::Result<()> {
     let cuda = flag(&mut args, "--cuda").is_some();
     let runs: usize = opt(&mut args, "--runs").map_or(10, |v| v.parse().unwrap());
     let boxes = opt(&mut args, "--boxes");
+    let pose = opt(&mut args, "--pose");
     let (model, pics) = args
         .split_first()
         .expect("usage: MODEL.onnx PICTURE.ppm...");
@@ -67,13 +68,35 @@ fn main() -> anyhow::Result<()> {
         d.device
     );
     let refs: Vec<&Picture> = pictures.iter().collect();
-    let found = d.detect(&refs)?; // warm-up, and the answer
+    let mut found = d.detect(&refs)?; // warm-up, and the answer
+    if let Some(path) = &pose {
+        let mut pm = argus_detect::pose::PoseModel::open(
+            path.as_ref(),
+            if cuda { Device::Cuda(0) } else { Device::Cpu },
+        )?;
+        for (p, f) in pictures.iter().zip(found.iter_mut()) {
+            let people: Vec<usize> = (0..f.len()).filter(|&i| f[i].label == "person").collect();
+            let bx: Vec<_> = people.iter().map(|&i| f[i].bbox).collect();
+            let t = Instant::now();
+            let feet = pm.feet(p, &bx)?;
+            if !bx.is_empty() {
+                println!(
+                    "pose: {} people in {:.1} ms",
+                    bx.len(),
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            for (&i, ft) in people.iter().zip(feet) {
+                f[i].foot = Some(ft);
+            }
+        }
+    }
     for (name, (p, f)) in pics.iter().zip(pictures.iter().zip(&found)) {
         println!("{name}:");
         for x in f {
             println!(
-                "  {:<7} {:<10} {:.2}  [{:.0}, {:.0}, {:.0}, {:.0}]",
-                x.label, x.class, x.score, x.bbox[0], x.bbox[1], x.bbox[2], x.bbox[3]
+                "  {:<7} {:<10} {:.2}  [{:.0}, {:.0}, {:.0}, {:.0}]  foot {:?}",
+                x.label, x.class, x.score, x.bbox[0], x.bbox[1], x.bbox[2], x.bbox[3], x.foot
             );
         }
         if let Some(dir) = &boxes {
@@ -93,6 +116,25 @@ fn main() -> anyhow::Result<()> {
                     for xx in [l, r] {
                         rgb[(yy * w + xx) * 3..(yy * w + xx) * 3 + 3]
                             .copy_from_slice(&[255, 0, 255]);
+                    }
+                }
+            }
+            for x in f {
+                if let Some(ft) = x.foot {
+                    let c = if ft.ankles {
+                        [0, 255, 0]
+                    } else {
+                        [255, 255, 0]
+                    };
+                    for dy in -4i32..=4 {
+                        for dx in -4i32..=4 {
+                            let (xx, yy) = (ft.x as i32 + dx, ft.y as i32 + dy);
+                            if xx >= 0 && yy >= 0 && (xx as u32) < p.width && (yy as u32) < p.height
+                            {
+                                let k = (yy as usize * w + xx as usize) * 3;
+                                rgb[k..k + 3].copy_from_slice(&c);
+                            }
+                        }
                     }
                 }
             }

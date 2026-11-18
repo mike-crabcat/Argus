@@ -40,10 +40,15 @@ landing one PR at a time.
    the spells against the camera's own events; `"events"` also makes each
    spell an event (source `argus`, with stills) and stops reading the
    camera's detections.
-4. **Pose.** RTMPose-s (Apache-2.0, MMPose) on person boxes only. The foot
-   point is the middle of the two ankles, or the bottom centre of the box
-   when the ankles aren't seen; it is what places people on the floor plan
-   once cameras are calibrated.
+4. **Pose** (`argus-detect::pose`, done). RTMPose-s (Apache-2.0,
+   OpenMMLab's ONNX export `rtmpose-s_simcc-body7_pt-body7_420e-256x192`)
+   runs on a close-up of each person box, about 2 ms a person on the GPU.
+   The foot point is between the ankles it is sure of (at the lower one),
+   or the bottom centre of the box when it is sure of neither; it is
+   stored with each track box (`foot_x`, `foot_y`). It is good when the
+   feet are in view; when they are hidden (behind a car) it guesses
+   below the box, so calibration should prefer points marked `ankles`
+   from unobstructed views.
 
 ## Rollout
 

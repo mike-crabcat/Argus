@@ -244,6 +244,7 @@ async fn run(cfg: Config) -> Result<()> {
                 path: path.clone(),
                 device: d.device()?,
                 threshold: d.threshold,
+                pose: d.pose.clone(),
             }),
             None => None,
         };

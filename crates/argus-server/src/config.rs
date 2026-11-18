@@ -39,6 +39,9 @@ pub struct DetectConfig {
     pub cameras: Vec<String>,
     /// The detection model (ONNX). Without it, streams are only decoded.
     pub model: Option<PathBuf>,
+    /// The pose model (ONNX), for where people stand. Without it, a
+    /// person's foot point is the bottom centre of their box.
+    pub pose: Option<PathBuf>,
     /// "cuda" (the default; GPU 0), "cuda:N" or "cpu".
     #[serde(default = "default_detect_device")]
     pub device: String,

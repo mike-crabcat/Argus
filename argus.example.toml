@@ -121,6 +121,8 @@ summarize = true                     # let the agent summarise this camera's eve
 # [detect]
 # model = "/var/lib/argus/models/dfine_s_coco.onnx"
 # device = "cuda"                # "cuda", "cuda:N" or "cpu"
+# pose = "/var/lib/argus/models/rtmpose-s.onnx"  # people's foot points; the
+#                                # ONNX in OpenMMLab's rtmpose-s_simcc-body7 zip
 # threshold = 0.5                # drop detections less sure than this
 # fps = 5                        # pictures a second to look at, per camera
 # stream = "sub"                 # which stream to decode (H.264)
