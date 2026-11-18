@@ -503,6 +503,18 @@ fn batches_can_number_their_walls_consecutively() {
     assert_eq!(again, p);
     p.apply(&inv).unwrap();
     assert_eq!(p.levels, before.levels);
+    // Checked application gives the same result, or names the command.
+    let mut c = before.clone();
+    c.apply_all_checked(&batch).unwrap();
+    assert_eq!(c, again);
+    let mut bad = batch.clone();
+    bad.push(Command::DeleteEntity {
+        level: lv,
+        id: Id(999),
+    });
+    let mut d = before.clone();
+    assert_eq!(d.apply_all_checked(&bad).unwrap_err().0, 5);
+    assert_eq!(d, before, "nothing applied");
 }
 
 #[test]

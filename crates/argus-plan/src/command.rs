@@ -301,6 +301,33 @@ impl Plan {
         })
     }
 
+    /// Like [`Plan::apply_all`], but says which command was refused (its
+    /// index), for feedback on a batch.
+    pub fn apply_all_checked(&mut self, cmds: &[Command]) -> Result<Command, (usize, PlanError)> {
+        let backup = self.clone();
+        let mut ids = Vec::new();
+        cmds.iter().for_each(|c| explicit_ids(c, &mut ids));
+        self.reserved = ids;
+        let mut inv = Vec::with_capacity(cmds.len());
+        let mut failed = None;
+        for (i, c) in cmds.iter().enumerate() {
+            match self.apply_inner(c) {
+                Ok(x) => inv.push(x),
+                Err(e) => {
+                    failed = Some((i, e));
+                    break;
+                }
+            }
+        }
+        self.reserved.clear();
+        if let Some(f) = failed {
+            *self = backup;
+            return Err(f);
+        }
+        inv.reverse();
+        Ok(Command::Batch { commands: inv })
+    }
+
     fn snapshot(&self, level: Id) -> Result<Command, PlanError> {
         Ok(Command::ReplaceLevel {
             level: self.lvl(level)?.clone(),
