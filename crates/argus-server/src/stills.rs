@@ -20,6 +20,23 @@ use crate::reolink;
 /// When stills are taken, after the event starts.
 pub const OFFSETS_MS: [u64; 3] = [0, 2_000, 5_000];
 
+/// A JPEG shrunk to fit `edge` pixels on its longer side, or None if it
+/// already fits.
+pub fn shrink(jpeg: &[u8], edge: u32) -> Result<Option<Vec<u8>>> {
+    use image::ImageDecoder;
+    let dec = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(jpeg))?;
+    let (w, h) = dec.dimensions();
+    if w.max(h) <= edge {
+        return Ok(None);
+    }
+    let img = image::DynamicImage::from_decoder(dec)?;
+    let small = img.resize(edge, edge, image::imageops::FilterType::Triangle);
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, MODEL_QUALITY)
+        .encode_image(&small.to_rgb8())?;
+    Ok(Some(out))
+}
+
 /// Something that can produce a still of one camera now.
 pub trait StillSource: Send + Sync {
     fn grab(&self) -> argus_agent::BoxFuture<'_, Result<Vec<u8>>>;
@@ -49,13 +66,48 @@ impl StillSource for ReolinkSnaps {
 #[derive(Clone)]
 pub struct StillStore {
     dir: PathBuf,
+    /// Stills sent to a model are shrunk to fit this many pixels on their
+    /// longer edge (0: as taken). The files on disk stay full size.
+    pub model_edge: u32,
 }
+
+/// The default for [`StillStore::model_edge`].
+pub const MODEL_EDGE: u32 = 1280;
+/// JPEG quality of shrunk stills.
+const MODEL_QUALITY: u8 = 80;
 
 impl StillStore {
     pub fn new(root: &Path) -> Self {
         StillStore {
             dir: root.join("events"),
+            model_edge: MODEL_EDGE,
         }
+    }
+
+    pub fn with_model_edge(mut self, edge: u32) -> Self {
+        self.model_edge = edge;
+        self
+    }
+
+    /// Still `n` of event `id` as a model should see it: shrunk to
+    /// [`Self::model_edge`]. Falls back to the file as taken if it can't
+    /// be decoded.
+    pub async fn for_model(&self, id: i64, n: u32) -> Option<Vec<u8>> {
+        let jpeg = self.read(id, n)?;
+        let edge = self.model_edge;
+        if edge == 0 {
+            return Some(jpeg);
+        }
+        tokio::task::spawn_blocking(move || match shrink(&jpeg, edge) {
+            Ok(Some(small)) => small,
+            Ok(None) => jpeg,
+            Err(e) => {
+                debug!("shrinking a still: {e:#}");
+                jpeg
+            }
+        })
+        .await
+        .ok()
     }
 
     /// The media key of still `n` of event `id` (`/api/media/{key}`).

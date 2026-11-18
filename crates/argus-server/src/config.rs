@@ -235,6 +235,11 @@ pub struct Camera {
     /// Where this camera's events come from. Reolink cameras (recognised by
     /// their stream URLs) default to their own detections.
     pub events: Option<EventsConfig>,
+    /// What the camera looks at, in a sentence, for the model (e.g. "looks
+    /// down the narrow side passage towards the clothesline"). Added to
+    /// event summaries and alert checks next to the floor plan's own
+    /// description.
+    pub context: Option<String>,
 }
 
 /// `[camera.events]`.
@@ -267,6 +272,9 @@ pub struct EventsConfig {
     /// to the camera's own events, to compare; "events" makes events from
     /// Argus's tracks instead of the camera's detections.
     pub detect: Option<String>,
+    /// At most one summary for this camera this often (seconds). Default:
+    /// the agent's `summary_gap_seconds`.
+    pub summary_gap_seconds: Option<u64>,
 }
 
 impl std::fmt::Debug for EventsConfig {
@@ -279,6 +287,9 @@ impl std::fmt::Debug for EventsConfig {
             .field("poll_ms", &self.poll_ms)
             .field("hold_ms", &self.hold_ms)
             .field("labels", &self.labels)
+            .field("stills", &self.stills)
+            .field("summarize", &self.summarize)
+            .field("summary_gap_seconds", &self.summary_gap_seconds)
             .field("detect", &self.detect)
             .finish()
     }
@@ -398,6 +409,11 @@ impl Camera {
     /// How long an event lasts after its last sighting.
     pub fn hold(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.events.as_ref().map_or(5000, |e| e.hold_ms))
+    }
+
+    /// This camera's own summary gap (seconds), if it has one.
+    pub fn summary_gap_seconds(&self) -> Option<u64> {
+        self.events.as_ref().and_then(|e| e.summary_gap_seconds)
     }
 
     /// Reolink event settings, if this camera's events come from Reolink.

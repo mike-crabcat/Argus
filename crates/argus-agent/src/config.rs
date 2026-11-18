@@ -57,6 +57,10 @@ pub struct AgentConfig {
     /// merged into it.
     #[serde(default = "default_gap")]
     pub summary_gap_seconds: u64,
+    /// Stills sent to the model are shrunk to fit this many pixels on
+    /// their longer edge (0: send them as taken). Smaller is cheaper.
+    #[serde(default = "default_still_edge")]
+    pub still_max_edge: u32,
     /// For provider = "mock": a JSON file of scripted answers.
     #[serde(default)]
     pub mock_script: Option<PathBuf>,
@@ -73,6 +77,9 @@ fn default_steps() -> usize {
 }
 fn default_true() -> bool {
     true
+}
+fn default_still_edge() -> u32 {
+    1280
 }
 fn default_gap() -> u64 {
     60
