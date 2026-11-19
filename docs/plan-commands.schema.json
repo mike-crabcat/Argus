@@ -71,6 +71,12 @@
           },
           "type": "array"
         },
+        "folded": {
+          "default": 0.0,
+          "description": "Share of the picture below its top 30% that the fit puts beyond the\nhorizon (behind the camera): a folded fit, 0 when sound.",
+          "format": "double",
+          "type": "number"
+        },
         "homography": {
           "description": "Picture fractions to plan mm, row-major 3x3.",
           "items": {
@@ -100,6 +106,14 @@
           "description": "Root mean square of the kept pairs' errors, mm.",
           "format": "double",
           "type": "number"
+        },
+        "warnings": {
+          "default": [],
+          "description": "Problems the errors don't show, in plain words: too few pairs, pairs\nbunched in one part of the picture or plan, a folded fit.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [

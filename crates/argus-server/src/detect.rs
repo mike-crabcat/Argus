@@ -387,16 +387,7 @@ impl Tracking {
         let make = |t: &argus_detect::track::Track, at: &mut Option<argus_plan::Point>| {
             let mut b = tbox(t);
             if let Some((_, cam)) = placed {
-                let foot = t.foot.unwrap_or([(t.bbox[0] + t.bbox[2]) / 2.0, t.bbox[3]]);
-                let image = [foot[0] as f64 / size.0, foot[1] as f64 / size.1];
-                if let Some(p) = argus_plan::calib::floor_point(cam, image) {
-                    let s = match *at {
-                        Some(prev) => prev.scale(1.0 - SMOOTHING) + p.scale(SMOOTHING),
-                        None => p,
-                    };
-                    *at = Some(s);
-                    b.plan = Some([s.x, s.y]);
-                }
+                place_box(cam, size, &mut b, at);
             }
             b
         };
@@ -485,6 +476,45 @@ impl Tracking {
                 warn!(camera = %f.camera, "storing a track: {e:#}");
             }
         }
+    }
+}
+
+/// Puts a box on the floor plan through `cam`'s calibration: its foot
+/// point (or the bottom centre of the box), smoothed against `at`, the
+/// track's position so far. `size` is the picture's, in pixels.
+fn place_box(
+    cam: &argus_plan::CameraPlacement,
+    size: (f64, f64),
+    b: &mut TrackBox,
+    at: &mut Option<argus_plan::Point>,
+) {
+    let foot = b.foot.unwrap_or([(b.bbox[0] + b.bbox[2]) / 2.0, b.bbox[3]]);
+    let image = [foot[0] as f64 / size.0, foot[1] as f64 / size.1];
+    b.plan = argus_plan::calib::floor_point(cam, image).map(|p| {
+        let s = match *at {
+            Some(prev) => prev.scale(1.0 - SMOOTHING) + p.scale(SMOOTHING),
+            None => p,
+        };
+        *at = Some(s);
+        [s.x, s.y]
+    });
+}
+
+/// Places a stored track's boxes through `cam`'s calibration as it is now,
+/// so tracks recorded before a camera was calibrated (or recalibrated)
+/// show on the plan where the current calibration puts them.
+pub fn reposition_boxes(
+    cam: &argus_plan::CameraPlacement,
+    width: u32,
+    height: u32,
+    boxes: &mut [TrackBox],
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let mut at = None;
+    for b in boxes {
+        place_box(cam, (width as f64, height as f64), b, &mut at);
     }
 }
 
@@ -931,6 +961,24 @@ pub mod http {
         let from = int(&q, "from").unwrap_or(now - 3_600_000);
         let to = int(&q, "to").unwrap_or(now + 60_000);
         let with_boxes = q.get("boxes").is_some_and(|v| v == "1");
+        // Calibrated cameras as the plan has them now, with their level.
+        let placed: HashMap<String, (i64, argus_plan::CameraPlacement)> = st
+            .plan
+            .as_ref()
+            .map(|p| {
+                p.get()
+                    .plan
+                    .levels
+                    .iter()
+                    .flat_map(|l| {
+                        l.cameras
+                            .iter()
+                            .filter(|c| c.calibration.is_some())
+                            .map(move |c| (c.camera.clone(), (l.id.0 as i64, c.clone())))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let index = rec.index.lock().unwrap();
         let rows = match index.tracks(q.get("camera").map(String::as_str), from, to) {
             Ok(r) => r,
@@ -941,9 +989,16 @@ pub mod http {
             .take(5000)
             .map(|t| {
                 let mut v = serde_json::to_value(t).unwrap_or_default();
+                let cam = placed.get(&t.camera);
+                if let Some((level, _)) = cam {
+                    v["level"] = json!(level);
+                }
                 if with_boxes {
-                    v["boxes"] = serde_json::to_value(index.track_boxes(t.id).unwrap_or_default())
-                        .unwrap_or_default();
+                    let mut boxes = index.track_boxes(t.id).unwrap_or_default();
+                    if let Some((_, cam)) = cam {
+                        super::reposition_boxes(cam, t.width, t.height, &mut boxes);
+                    }
+                    v["boxes"] = serde_json::to_value(boxes).unwrap_or_default();
                 }
                 v
             })
@@ -1030,6 +1085,20 @@ mod position_tests {
             let [x, y] = b.plan.expect("a position");
             let off = argus_plan::pt(x, y).dist(want);
             assert!(off < 250.0, "picture {k}: {off} mm off");
+        }
+        // Stored before the camera was calibrated: placed when read back,
+        // the same as when stored.
+        let mut later: Vec<TrackBox> = boxes
+            .iter()
+            .map(|b| TrackBox {
+                plan: None,
+                ..b.clone()
+            })
+            .collect();
+        reposition_boxes(&cam, tracks[0].width, tracks[0].height, &mut later);
+        for (a, b) in boxes.iter().zip(&later) {
+            let (a, b) = (a.plan.unwrap(), b.plan.expect("placed on reading"));
+            assert!((a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6);
         }
     }
 }
