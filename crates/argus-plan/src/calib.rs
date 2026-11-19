@@ -37,6 +37,14 @@ pub struct Calibration {
     pub outliers: Vec<usize>,
     /// Root mean square of the kept pairs' errors, mm.
     pub rms_mm: f64,
+    /// Share of the picture below its top 30% that the fit puts beyond the
+    /// horizon (behind the camera): a folded fit, 0 when sound.
+    #[serde(default)]
+    pub folded: f64,
+    /// Problems the errors don't show, in plain words: too few pairs, pairs
+    /// bunched in one part of the picture or plan, a folded fit.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -350,13 +358,124 @@ pub fn fit(pairs: &[CalPair]) -> Result<Calibration, CalError> {
     let errors: Vec<f64> = pairs.iter().map(|p| error(&h, p)).collect();
     let rms_mm =
         (keep.iter().map(|&i| errors[i] * errors[i]).sum::<f64>() / keep.len() as f64).sqrt();
-    Ok(Calibration {
+    let mut c = Calibration {
         pairs: pairs.to_vec(),
         homography: h,
         errors,
         outliers: (0..n).filter(|i| !keep.contains(i)).collect(),
         rms_mm,
-    })
+        folded: 0.0,
+        warnings: Vec::new(),
+    };
+    c.folded = folded_share(&c);
+    c.warnings = warnings(&c);
+    Ok(c)
+}
+
+/// Pairs fewer than this fit (nearly) exactly, so a mis-click can't show.
+pub const GOOD_PAIRS: usize = 6;
+
+/// The sign of the homography's w on the kept pairs' side of the horizon.
+fn front_sign(c: &Calibration) -> f64 {
+    let h = &c.homography;
+    let s: f64 = c
+        .pairs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !c.outliers.contains(i))
+        .map(|(_, p)| (h[6] * p.image[0] + h[7] * p.image[1] + h[8]).signum())
+        .sum();
+    if s < 0.0 { -1.0 } else { 1.0 }
+}
+
+/// Whether the fit puts a picture point beyond the horizon: on the other
+/// side of it from the clicked pairs, so behind the camera. Such a point
+/// still projects somewhere on the plan, mirrored, which is always wrong.
+pub fn beyond_horizon(c: &Calibration, image: [f64; 2]) -> bool {
+    let h = &c.homography;
+    let w = h[6] * image[0] + h[7] * image[1] + h[8];
+    w * front_sign(c) <= 1e-12 * h[8].abs().max(1e-12)
+}
+
+/// Share of the picture below its top 30% (where the ground usually is)
+/// that the fit puts beyond the horizon.
+fn folded_share(c: &Calibration) -> f64 {
+    let (nx, ny) = (32, 24);
+    let mut n = 0;
+    let mut bad = 0;
+    for j in 0..ny {
+        let v = 0.3 + 0.7 * (j as f64 + 0.5) / ny as f64;
+        for i in 0..nx {
+            let u = (i as f64 + 0.5) / nx as f64;
+            n += 1;
+            if beyond_horizon(c, [u, v]) {
+                bad += 1;
+            }
+        }
+    }
+    bad as f64 / n as f64
+}
+
+fn warnings(c: &Calibration) -> Vec<String> {
+    let mut out = Vec::new();
+    let kept: Vec<&CalPair> = c
+        .pairs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !c.outliers.contains(i))
+        .map(|(_, p)| p)
+        .collect();
+    if c.folded > 0.01 {
+        out.push(format!(
+            "{:.0}% of the picture lands behind the camera (shaded red): the fit has folded over. Usually the pairs are too close together or one is wrong.",
+            c.folded * 100.0
+        ));
+    }
+    if c.pairs.len() < GOOD_PAIRS {
+        out.push(format!(
+            "Only {} pairs: any four fit exactly, so a mis-click can't show. Add {} more.",
+            c.pairs.len(),
+            GOOD_PAIRS - c.pairs.len()
+        ));
+    }
+    let range = |f: &dyn Fn(&CalPair) -> f64| {
+        kept.iter()
+            .map(|p| f(p))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |a, v| {
+                (a.0.min(v), a.1.max(v))
+            })
+    };
+    let (u0, u1) = range(&|p| p.image[0]);
+    let (v0, v1) = range(&|p| p.image[1]);
+    let mut missing = Vec::new();
+    if u0 > 0.3 {
+        missing.push("the left");
+    }
+    if u1 < 0.7 {
+        missing.push("the right");
+    }
+    if v1 < 0.75 {
+        missing.push("the bottom (near the camera)");
+    }
+    if v0 > 0.55 {
+        missing.push("further away (higher in the picture)");
+    }
+    if !missing.is_empty() {
+        out.push(format!(
+            "The picture points cover only part of the view; positions outside them are guesses. Add pairs on {}.",
+            missing.join(", ")
+        ));
+    }
+    let (x0, x1) = range(&|p| p.plan.x);
+    let (y0, y1) = range(&|p| p.plan.y);
+    if (x1 - x0).max(y1 - y0) < 4000.0 {
+        out.push(format!(
+            "The plan points span only {:.1} x {:.1} m: spread them across everything the camera sees.",
+            (x1 - x0) / 1000.0,
+            (y1 - y0) / 1000.0
+        ));
+    }
+    out
 }
 
 /// Where on the floor a picture point (fractions) of a calibrated camera
@@ -366,6 +485,9 @@ pub fn fit(pairs: &[CalPair]) -> Result<Calibration, CalError> {
 /// head above the horizon lands far off; better no point than a wrong one.
 pub fn floor_point(cam: &crate::model::CameraPlacement, image: [f64; 2]) -> Option<Point> {
     let c = cam.calibration.as_ref()?;
+    if beyond_horizon(c, image) {
+        return None;
+    }
     let p = project(&c.homography, image)?;
     let d = p - cam.at;
     let dist = d.len();
@@ -456,6 +578,79 @@ mod tests {
             assert!(got.dist(want) < 1e-6, "{got:?} vs {want:?}");
         }
         assert!(c.rms_mm < 1e-6 && c.outliers.is_empty());
+    }
+
+    /// The back camera's first real calibration: four pairs in a 2.4 x
+    /// 1.5 m patch of paving, all in the right half of the picture. It
+    /// fits its pairs exactly but folds: the left of the picture lands
+    /// behind the camera, and everything else in a narrow strip.
+    #[test]
+    fn a_bunched_calibration_is_flagged() {
+        let ps = [
+            ([0.698, 0.487], pt(17345.0, 23893.0)),
+            ([0.591, 0.811], pt(14920.0, 22362.0)),
+            ([0.929, 0.624], pt(17235.0, 22380.0)),
+            ([0.817, 0.559], pt(17272.0, 22964.0)),
+        ]
+        .map(|(image, plan)| CalPair { image, plan });
+        let c = fit(&ps).unwrap();
+        assert!(c.rms_mm < 1e-6, "it fits its own pairs exactly");
+        assert!(c.folded > 0.15, "{}", c.folded);
+        assert!(beyond_horizon(&c, [0.1, 0.9]));
+        assert!(!beyond_horizon(&c, [0.8, 0.6]));
+        let w = c.warnings.join("\n");
+        for want in [
+            "behind the camera",
+            "Only 4 pairs",
+            "the left",
+            "span only 2.4 x 1.5 m",
+        ] {
+            assert!(w.contains(want), "{want:?} not in {w}");
+        }
+        // Positions beyond the horizon are refused, not mirrored.
+        let cam = crate::model::CameraPlacement {
+            id: crate::model::Id(1),
+            camera: "back".into(),
+            at: pt(12700.0, 20900.0),
+            heading: 50.0,
+            fov: 90.0,
+            range: 10000.0,
+            mount_height: 2400.0,
+            calibration: Some(c),
+        };
+        assert_eq!(floor_point(&cam, [0.1, 0.9]), None);
+    }
+
+    #[test]
+    fn a_spread_calibration_has_no_warnings() {
+        let cam = crate::model::CameraPlacement {
+            id: crate::model::Id(1),
+            camera: "door".into(),
+            at: pt(0.0, 0.0),
+            heading: 90.0,
+            fov: 90.0,
+            range: 10000.0,
+            mount_height: 2500.0,
+            calibration: None,
+        };
+        let h = pinhole(&cam, 4.0 / 3.0).unwrap();
+        let ps: Vec<CalPair> = [
+            [0.1, 0.5],
+            [0.9, 0.5],
+            [0.15, 0.95],
+            [0.85, 0.95],
+            [0.5, 0.7],
+            [0.4, 0.45],
+        ]
+        .iter()
+        .map(|&p| CalPair {
+            image: p,
+            plan: project(&h, p).unwrap(),
+        })
+        .collect();
+        let c = fit(&ps).unwrap();
+        assert_eq!(c.folded, 0.0);
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
     }
 
     #[test]

@@ -182,6 +182,27 @@ impl PlanView {
             theme::regular(12.0),
             TEXT_2,
         );
+        // Where the fit puts the picture behind the camera (beyond its
+        // horizon): shaded, since positions there are refused.
+        if let Some(Ok(fit)) = &k.fit
+            && fit.folded > 0.0
+        {
+            let (nx, ny) = (48, 36);
+            let (cw, ch) = (img.width() / nx as f32, img.height() / ny as f32);
+            for j in 0..ny {
+                for i in 0..nx {
+                    let f = [(i as f64 + 0.5) / nx as f64, (j as f64 + 0.5) / ny as f64];
+                    if calib::beyond_horizon(fit, f) {
+                        let at = pos2(img.left() + i as f32 * cw, img.top() + j as f32 * ch);
+                        p.rect_filled(
+                            Rect::from_min_size(at, vec2(cw + 0.5, ch + 0.5)),
+                            CornerRadius::ZERO,
+                            ALERT.gamma_multiply(0.28),
+                        );
+                    }
+                }
+            }
+        }
         // The plan's metre grid on the floor, through the fit.
         if let Some(Ok(fit)) = &k.fit
             && let Some(inv) = calib::picture_map(&fit.homography)
@@ -293,7 +314,7 @@ impl PlanView {
         heading(ui, &format!("Calibrate {}", k.name));
         hint(
             ui,
-            "Click a spot on the ground in the picture, then the same spot on the plan: corners of paving, the foot of a post, a door threshold. Four or more, spread across the view; with six or more, a mis-click is spotted and set aside.",
+            "Click a spot on the ground in the picture, then the same spot on the plan: corners of paving, the foot of a post, a door threshold. Use six or more, spread across the whole view: left and right, near the bottom of the picture and further away. Four is the minimum, but four always fit exactly, so mistakes can't show.",
         );
         if k.pending.is_some() {
             ui.label(
@@ -313,7 +334,11 @@ impl PlanView {
                 ui.label(egui::RichText::new(e).color(ALERT));
             }
             Some(Ok(f)) => {
-                let quality = if f.rms_mm < 150.0 {
+                let quality = if f.folded > 0.01 {
+                    "poor"
+                } else if f.rms_mm < 150.0 && !f.warnings.is_empty() {
+                    "fair"
+                } else if f.rms_mm < 150.0 {
                     "good"
                 } else if f.rms_mm < 400.0 {
                     "fair"
@@ -339,6 +364,10 @@ impl PlanView {
                         ui,
                         "Pairs set aside disagree with the rest: likely a mis-click. Remove them or click again.",
                     );
+                }
+                for w in &f.warnings {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(w).color(ALERT));
                 }
             }
         }
